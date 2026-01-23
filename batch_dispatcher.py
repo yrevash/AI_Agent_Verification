@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "X-sign-Secret": "QONEQT1607_AI",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
@@ -178,6 +179,95 @@ class GoogleSheetLogger:
 
 # Global Google Sheets logger instance (will be initialized in main)
 google_sheet_logger = None
+
+import sqlite3
+import shutil
+
+class LocalDBLogger:
+    def __init__(self, db_name="local_kyc_data.db"):
+        """Initialize Local SQLite Database with Production Settings"""
+        self.db_name = db_name
+        self._backup_db() # 1. Auto-backup on startup
+        self._init_db()
+
+    def _backup_db(self):
+        """Create a safety backup on restart if DB exists"""
+        if os.path.exists(self.db_name):
+            try:
+                backup_name = f"{self.db_name}.backup"
+                shutil.copy2(self.db_name, backup_name)
+                logger.info(f"🛡️  Created startup backup: {backup_name}")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to backup DB: {e}")
+
+    def _init_db(self):
+        """Create table and Enable WAL mode"""
+        try:
+            with sqlite3.connect(self.db_name) as conn:
+                # 2. Enable Write-Ahead Logging (WAL) for concurrency/speed
+                conn.execute("PRAGMA journal_mode=WAL;")
+                
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS kyc_records (
+                        user_id TEXT PRIMARY KEY,
+                        agent_id TEXT,
+                        final_decision TEXT,
+                        status_code INTEGER,
+                        score REAL,
+                        aadhaar_number TEXT,
+                        timestamp DATETIME,
+                        full_json_log TEXT
+                    )
+                """)
+                
+                # 3. Add Indices for faster querying later
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent ON kyc_records(agent_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_decision ON kyc_records(final_decision);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON kyc_records(timestamp);")
+                
+                conn.commit()
+                logger.info("✅ Local SQLite Database initialized (WAL Mode)")
+        except Exception as e:
+            logger.error(f"❌ Failed to init Local DB: {e}")
+
+    def save_record(self, user_log):
+        """Save user log to SQLite"""
+        try:
+            # Extract key fields for columns
+            user_id = str(user_log.get("user_id"))
+            agent_id = str(user_log.get("agent_id"))
+            timestamp = user_log.get("timestamp")
+            
+            final_res = user_log.get("final_result", {})
+            decision = final_res.get("final_decision", "UNKNOWN")
+            status_code = final_res.get("status_code", 0)
+            score = final_res.get("score", 0)
+            
+            # Extract aadhaar specifically if available
+            extracted = final_res.get("extracted_data", {})
+            aadhaar = extracted.get("aadhaar", "") or extracted.get("aadhaar_number", "")
+
+            # Convert full dict to JSON string
+            full_json = json.dumps(user_log, ensure_ascii=False)
+
+            with sqlite3.connect(self.db_name, timeout=10) as conn: # 10s timeout to wait for locks
+                cursor = conn.cursor()
+                # UPSERT (Insert or Replace if user_id exists)
+                # This ensures if you re-run a user, it updates the record instead of crashing
+                cursor.execute("""
+                    INSERT OR REPLACE INTO kyc_records 
+                    (user_id, agent_id, final_decision, status_code, score, aadhaar_number, timestamp, full_json_log)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, agent_id, decision, status_code, score, aadhaar, timestamp, full_json))
+                conn.commit()
+                logger.info(f"💾 Saved User {user_id} to Local DB")
+        except Exception as e:
+            logger.error(f"❌ Database Save Error for {user_id}: {e}")
+
+# Initialize Global DB Instance
+local_db = LocalDBLogger()
+
 
 def create_session_log_file(agent_id):
     """Create a new session log file for this run"""
@@ -611,13 +701,18 @@ async def process_single_user(session, user, session_dir, agent_id):
             "extracted_data": ai_result.get("extracted_data", {}),
             "rejection_reasons": ai_result.get("rejection_reasons", [])
         }
+        submission_headers = {
+            
+            "X-sign-Secret": "QONEQT1607_AI",
+            "Content-Type": "application/json"
+        }
         
         push_start_time = time.time()
         push_api_response = None
         push_success = False
         
         try:
-            async with session.post(push_url, json=push_payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as push_resp:
+            async with session.post(push_url, json=push_payload, headers=submission_headers, timeout=aiohttp.ClientTimeout(total=25)) as push_resp:
                 push_elapsed = time.time() - push_start_time
                 
                 push_call_log = {
@@ -786,6 +881,12 @@ async def process_single_user(session, user, session_dir, agent_id):
             google_sheet_logger.log(user_log)
         except Exception as e:
             logger.error(f"Failed to log User {user_id} to Google Sheets: {e}")
+
+    try:
+        local_db.save_record(user_log)
+    except Exception as e:
+        logger.error(f"Failed to save to Local DB: {e}")
+
     
     return user_log
 
