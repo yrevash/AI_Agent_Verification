@@ -3,13 +3,12 @@ from datetime import datetime
 
 class VerificationScorer:
     def __init__(self):
-        # Weights (Total 100) - Original Configuration
+        # Weights (Total 100) - Updated Configuration
         self.weights = {
-            "face": 15,      # Face Similarity (reduced from 40)
-            "face_recog": 5,  # Face Recognition ( to be implemented separately)
-            "aadhar": 30,    # Valid Aadhaar Number (increased from 20)
-            "dob": 30,       # Valid Age/DOB (increased from 20)
-            "gender": 20     # Gender Match (unchanged)
+            "aadhar": 35,           # Valid Aadhaar Number
+            "dob": 35,              # Valid Age/DOB
+            "gender": 15,           # Gender Match (Input vs Aadhaar)
+            "face_gender": 15       # Face Gender Match (Selfie vs Aadhaar using Qwen)
         }
     
     def _normalize_dob(self, dob_string):
@@ -42,81 +41,15 @@ class VerificationScorer:
         
         return None
 
-    def calculate_score(self, face_data, entity_data, expected_gender, expected_dob=None, qwen_face_result=None):
+    def calculate_score(self, face_data, entity_data, expected_gender, expected_dob=None, qwen_face_result=None, face_gender_match=None):
         score = 0
         breakdown = {}
         rejection_reasons = []
         critical_failure = False  # If True, status is REJECTED regardless of score
         qwen_override = False  # Flag to track if Qwen provided override decision
 
-        # --- 1. Face Similarity (0 - 20 points) ---
-        face_sim = face_data.get("score", 0)
-        low_face_sim = False
-        
-        # Check if Qwen face verification was performed and successful
-        if qwen_face_result and face_sim < 20:
-            qwen_decision = qwen_face_result.get('decision', 'REJECTED')
-            qwen_face_match = qwen_face_result.get('face_match', False)
-            qwen_gender_match = qwen_face_result.get('gender_match', False)
-            qwen_confidence = qwen_face_result.get('confidence', 'Low')
-            
-            print(f"🔍 Qwen Face Verification Override Active:")
-            print(f"   Decision: {qwen_decision}")
-            print(f"   Face Match: {qwen_face_match}")
-            print(f"   Gender Match: {qwen_gender_match}")
-            print(f"   Confidence: {qwen_confidence}")
-            
-            if qwen_decision == 'APPROVED':
-                # Qwen approved - override low face similarity
-                # Award points based on confidence
-                if qwen_confidence == 'High':
-                    breakdown["face_score"] = self.weights["face"]  # Full points
-                    score += self.weights["face"]
-                    breakdown["qwen_face_verification"] = "Approved (High Confidence)"
-                elif qwen_confidence == 'Medium':
-                    breakdown["face_score"] = self.weights["face"] * 0.8  # 80% points
-                    score += self.weights["face"] * 0.8
-                    breakdown["qwen_face_verification"] = "Approved (Medium Confidence)"
-                else:
-                    breakdown["face_score"] = self.weights["face"] * 0.5  # 50% points
-                    score += self.weights["face"] * 0.5
-                    breakdown["qwen_face_verification"] = "Approved (Low Confidence)"
-                qwen_override = True
-                low_face_sim = False
-                
-                # Update gender from Qwen if detected
-                if qwen_gender_match and qwen_face_result.get('gender_detected') != 'Unknown':
-                    entity_data['gender'] = qwen_face_result.get('gender_detected')
-                    entity_data['gender_source'] = 'qwen_vlm'
-                    
-            elif qwen_decision == 'REVIEW':
-                # Qwen uncertain - give partial points
-                breakdown["face_score"] = self.weights["face"] * 0.4  # 40% points
-                score += self.weights["face"] * 0.4
-                breakdown["qwen_face_verification"] = "Manual Review Required"
-                low_face_sim = True
-            else:
-                # Qwen rejected - enforce rejection
-                breakdown["face_score"] = 0
-                low_face_sim = True
-                critical_failure = True
-                rejection_reasons.append(f"Qwen VLM Face Verification Failed: {qwen_face_result.get('reason', 'Unknown')}")
-                breakdown["qwen_face_verification"] = "Rejected"
-        
-        elif face_sim < 20:
-            # Very low face similarity - Give 0 points and flag for review
-            breakdown["face_score"] = 0
-            low_face_sim = True
-            critical_failure = True
-            rejection_reasons.append(f"Low Face Similarity (Similarity: {face_sim:.2f}%)")
-        else:
-            # Between 20% and 100% -> Scale linearly to 0-15 points
-            # Formula: ((Score - 20) / 80) * 15, where 80 is the range (100-20)
-            face_points = ((face_sim - 20) / 80) * self.weights["face"]
-            score += face_points
-            breakdown["face_score"] = round(face_points, 2)
 
-        # --- 2. Aadhaar Validity & Masking (0 - 30 points) ---
+        # --- 1. Aadhaar Validity & Masking (0 - 40 points) ---
         aadhaar_num = entity_data.get("aadharnumber", "").replace(" ", "")
         aadhaar_original = entity_data.get("aadharnumber", "")
         
@@ -138,7 +71,7 @@ class VerificationScorer:
             score += self.weights["aadhar"]
             breakdown["aadhar_score"] = self.weights["aadhar"]
 
-        # --- 3. DOB & Age Check (0 - 20 points) ---
+        # --- 2. DOB & Age Check (0 - 40 points) ---
         extracted_dob = entity_data.get("dob", "")
         age_status = entity_data.get("age_status") # Calculated in entity.py
         
@@ -173,7 +106,7 @@ class VerificationScorer:
         score += dob_score
         breakdown["dob_score"] = dob_score
 
-        # --- 4. Gender Check (0 - 20 points + Bonus) ---
+        # --- 3. Gender Check (0 - 20 points) ---
         # Normalize Helper
         def clean_gender(g):
             if not g: return "unknown"
@@ -217,16 +150,27 @@ class VerificationScorer:
         score += gender_score
         breakdown["gender_score"] = gender_score
 
+        # --- 4. Face Gender Match (0 - 15 points) ---
+        # Qwen-based selfie gender verification
+        face_gender_score = 0
+        if face_gender_match is not None:
+            if face_gender_match:
+                # Selfie gender matches Aadhaar gender
+                face_gender_score = self.weights["face_gender"]
+            else:
+                # Selfie gender doesn't match - give 0 points but don't reject
+                face_gender_score = 0
+                # Note: We don't set critical_failure here, just reduce score
+        
+        score += face_gender_score
+        breakdown["face_gender_score"] = face_gender_score
+
         # --- FINAL DECISION ---
         if critical_failure:
             status = "REJECTED"
-        elif score > 60.1:
-            # High score -> APPROVED (even with low face sim)
+        elif score > 60:
             status = "APPROVED"
-        elif low_face_sim and score >= 60:
-            # Low face similarity but decent score -> REVIEW
-            status = "REVIEW"
-        elif 40 <= score <= 60.1:
+        elif score >= 40:
             status = "REVIEW"
         else:
             status = "REJECTED"

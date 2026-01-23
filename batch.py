@@ -35,6 +35,7 @@ import requests
 import base64
 from PIL import Image
 import io
+from scoring import VerificationScorer
 
 # --- Ollama Qwen Agent ---
 class OllamaQwenAgent:
@@ -116,6 +117,7 @@ class OllamaQwenAgent:
 4. Gender/Sex
 5. Address
 6. Pincode
+7. Is this a Masked Aadhaar? (Look for 'X' or '*' in the first 8 digits of the number)
 
 Return ONLY in this exact JSON format:
 {
@@ -124,7 +126,8 @@ Return ONLY in this exact JSON format:
   "dob": "DD/MM/YYYY",
   "gender": "Male or Female",
   "address": "Full Address",
-  "pincode": "123456"
+  "pincode": "123456",
+  "is_masked": true/false
 }
 
 If any field is not clearly visible, use empty string "". Do not include any explanation, only return the JSON."""
@@ -188,6 +191,7 @@ If any field is not clearly visible, use empty string "". Do not include any exp
 qwen_agent = None
 gender_pipeline = None
 http_session = None
+verification_scorer = None
 
 TEMP_DIR = Path("batch_temp")
 PROGRESS_FILE = "batch_progress.json"
@@ -207,7 +211,7 @@ batch_progress = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
-    global qwen_agent, gender_pipeline, http_session
+    global qwen_agent, gender_pipeline, http_session, verification_scorer
     
     # Startup
     TEMP_DIR.mkdir(exist_ok=True)
@@ -249,6 +253,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ GenderPipeline initialization failed: {e}")
         gender_pipeline = None
+    
+    # Initialize VerificationScorer
+    try:
+        print("Initializing VerificationScorer...")
+        verification_scorer = VerificationScorer()
+        print("✅ VerificationScorer initialized")
+    except Exception as e:
+        print(f"⚠️ VerificationScorer initialization failed: {e}")
+        verification_scorer = None
     
     print("=" * 70)
     print("✅ BATCH SERVER READY")
@@ -384,12 +397,10 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
         "score": 0,
         "aadhaar_found": False,
         "aadhaar_number": "", "aadhaar_name": "", "aadhaar_dob": "", "aadhaar_gender": "", "aadhaar_address": "", "aadhaar_pincode": "",
-        "pan_found": False,
-        "pan_number": "", "pan_name": "", "pan_father_name": "", "pan_dob": "",
-        "selfie_gender": "", "gender_match": False, "gender_confidence": 0.0,
+        "gender_match": False,
         "extracted_data": {},
         "input_data": { "dob": expected_dob, "gender": expected_gender },
-        "rejection_reasons": [], "breakdown": {}, "error_log": ""
+        "rejection_reasons": [], "error_log": ""
     }
     
     if not qwen_agent:
@@ -410,14 +421,31 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
             )
             
             if aadhaar_data and "error" not in aadhaar_data:
-                user_record["aadhaar_found"] = True
-                user_record["aadhaar_number"] = aadhaar_data.get("aadharnumber", "")
-                user_record["aadhaar_name"] = aadhaar_data.get("name", "")
-                user_record["aadhaar_dob"] = aadhaar_data.get("dob", "")
-                user_record["aadhaar_gender"] = aadhaar_data.get("gender", "")
-                user_record["aadhaar_address"] = aadhaar_data.get("address", "")
-                user_record["aadhaar_pincode"] = aadhaar_data.get("pincode", "")
-                print(f"[{user_id}] ✅ Aadhaar extracted - Gender: {user_record['aadhaar_gender']}")
+                # Check for Masked Aadhaar
+                is_masked = aadhaar_data.get("is_masked", False)
+                
+                # Double check for masking in the number string itself
+                aadhar_num = aadhaar_data.get("aadharnumber", "")
+                if "X" in aadhar_num.upper() or "*" in aadhar_num:
+                    is_masked = True
+
+                if is_masked:
+                     user_record["status"] = "REJECTED"
+                     user_record["final_decision"] = "REJECTED"
+                     user_record["status_code"] = 1
+                     user_record["rejection_reasons"].append("aadhaar_masked")
+                     user_record["aadhaar_found"] = True # It was found, just rejected
+                     user_record["error_log"] += "Masked Aadhaar detected; "
+                     print(f"[{user_id}] ❌ REJECTED: Masked Aadhaar detected")
+                else:
+                    user_record["aadhaar_found"] = True
+                    user_record["aadhaar_number"] = aadhar_num
+                    user_record["aadhaar_name"] = aadhaar_data.get("name", "")
+                    user_record["aadhaar_dob"] = aadhaar_data.get("dob", "")
+                    user_record["aadhaar_gender"] = aadhaar_data.get("gender", "")
+                    user_record["aadhaar_address"] = aadhaar_data.get("address", "")
+                    user_record["aadhaar_pincode"] = aadhaar_data.get("pincode", "")
+                    print(f"[{user_id}] ✅ Aadhaar extracted - Gender: {user_record['aadhaar_gender']}")
             else:
                 error_msg = aadhaar_data.get("error", "Unknown error") if aadhaar_data else "No response"
                 user_record["error_log"] += f"Aadhaar extraction failed: {error_msg}; "
@@ -450,94 +478,155 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
         except Exception as e:
             user_record["error_log"] += f"PAN exception: {str(e)}; "
 
-    # Step 3: Gender Verification - FIXED CRASH HERE
-    if images.get("selfie") and gender_pipeline:
-        temp_selfie_path = None
+    
+    # Step 3: Qwen-based Selfie Gender Detection (before scoring)
+    face_gender_match = None
+    if images.get("selfie") and qwen_agent and user_record["aadhaar_gender"]:
         try:
-            print(f"[{user_id}] Detecting gender from selfie...")
+            print(f"[{user_id}] Detecting gender from selfie using Qwen...")
             
-            # --- CRITICAL FIX: Handle BytesIO vs Path ---
-            # The gender pipeline requires a file path (string), it cannot read BytesIO.
-            # If input is memory bytes, we MUST save to a temp file first.
             selfie_input = images["selfie"]
-            pipeline_input = None
+            gender_prompt = """Analyze this selfie image and determine the person's gender.
             
-            if isinstance(selfie_input, io.BytesIO):
-                # Create a temporary file
-                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                try:
-                    tfile.write(selfie_input.getvalue())
-                    tfile.flush()
-                finally:
-                    tfile.close()
-                temp_selfie_path = tfile.name
-                pipeline_input = temp_selfie_path
-            else:
-                pipeline_input = str(selfie_input)
+Return ONLY in this exact JSON format:
+{
+  "gender": "Male or Female",
+  "confidence": "High or Medium or Low"
+}
 
-            # Run detection using the FILE PATH
-            gender_result = await loop.run_in_executor(
-                None,
-                gender_pipeline.detect_gender,
-                pipeline_input
+Do not include any explanation, only return the JSON."""
+            
+            selfie_b64 = qwen_agent._image_to_base64(selfie_input)
+            
+            if selfie_b64:
+                response_text = qwen_agent._call_ollama(gender_prompt, [selfie_b64])
+                import re
+                json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+                if json_match:
+                    import json
+                    gender_data = json.loads(json_match.group())
+                    selfie_gender = gender_data.get("gender", "").strip()
+                    confidence = gender_data.get("confidence", "Low")
+                    
+                    print(f"[{user_id}] 📷 Selfie gender: {selfie_gender} (confidence: {confidence})")
+                    
+                    aadhaar_gender = user_record["aadhaar_gender"].lower()
+                    selfie_gender_normalized = selfie_gender.lower()
+                    
+                    if aadhaar_gender and selfie_gender_normalized in ['male', 'female']:
+                        if aadhaar_gender == selfie_gender_normalized:
+                            face_gender_match = True
+                            print(f"[{user_id}] ✅ Selfie gender matches Aadhaar")
+                        else:
+                            face_gender_match = False
+                            print(f"[{user_id}] ⚠️ Selfie gender mismatch")
+                
+        except Exception as e:
+            print(f"[{user_id}] ⚠️ Selfie gender detection failed: {e}")
+            user_record["error_log"] += f"Selfie gender detection failed: {str(e)}; "
+    
+    # Step 3b: Qwen Face Similarity
+    face_similarity_score = 0
+    if images.get("selfie") and images.get("aadhar_front") and qwen_agent:
+        try:
+            print(f"[{user_id}] Checking face similarity...")
+            prompt = """Compare these images. Same person? Return JSON: {"similarity_percentage": 0-100}"""
+            s_b64 = qwen_agent._image_to_base64(images["selfie"])
+            a_b64 = qwen_agent._image_to_base64(images["aadhar_front"])
+            if s_b64 and a_b64:
+                resp = qwen_agent._call_ollama(prompt, [s_b64, a_b64])
+                import re, json
+                m = re.search(r'\{[^}]+\}', resp, re.DOTALL)
+                if m:
+                    face_similarity_score = json.loads(m.group()).get("similarity_percentage", 0)
+                    print(f"[{user_id}] Similarity: {face_similarity_score}%")
+        except Exception as e:
+            print(f"[{user_id}] Similarity check failed: {e}")
+    
+    # Step 3: Calculate Score using VerificationScorer
+    if verification_scorer:
+        try:
+            # Prepare entity_data in the format expected by scoring.py
+            entity_data = {
+                "aadharnumber": user_record["aadhaar_number"],
+                "name": user_record["aadhaar_name"],
+                "dob": user_record["aadhaar_dob"],
+                "gender": user_record["aadhaar_gender"],
+                "address": user_record["aadhaar_address"],
+                "age_status": "age_approved"  # We don't have age validation yet, assume approved if DOB extracted
+            }
+            
+            # Face data (not implemented yet, set to 0)
+            face_data = {"score": 0}
+            
+            # Calculate score using VerificationScorer
+            scoring_result = verification_scorer.calculate_score(
+                face_data=face_data,
+                entity_data=entity_data,
+                expected_gender=expected_gender,
+                expected_dob=expected_dob,
+                qwen_face_result=None,
+                face_gender_match=face_gender_match  # Pass selfie gender match result
             )
             
-            if hasattr(gender_result, 'face_detected') and gender_result.face_detected:
-                detected_gender = gender_result.gender.capitalize() if hasattr(gender_result, 'gender') else 'Unknown'
-                confidence = gender_result.confidence if hasattr(gender_result, 'confidence') else 0.0
+            # Extract results
+            final_score = scoring_result["total_score"]
+            final_status = scoring_result["status"]
+            breakdown = scoring_result["breakdown"]
+            rejection_reasons = scoring_result["rejection_reasons"]
+            
+            # Update user_record with scoring results
+            user_record["score"] = final_score
+            user_record["status"] = final_status
+            user_record["final_decision"] = final_status
+            
+            # Map status to status_code
+            status_code_map = {"APPROVED": 2, "REVIEW": 0, "REJECTED": 1}
+            user_record["status_code"] = status_code_map.get(final_status, 0)
+            
+            # Add rejection reasons
+            user_record["rejection_reasons"].extend(rejection_reasons)
+            
+            # Update gender_match based on breakdown
+            if "gender_score" in breakdown:
+                user_record["gender_match"] = breakdown["gender_score"] > 0
+            
+            print(f"[{user_id}] → {final_status} (Score: {final_score})")
+            if rejection_reasons:
+                print(f"[{user_id}] Rejection Reasons: {', '.join(rejection_reasons)}")
+            
+            # Override: Gender mismatch or low similarity → REVIEW
+            if final_status != "REJECTED":
+                if face_gender_match == False:
+                    user_record["status"] = "REVIEW"
+                    user_record["final_decision"] = "REVIEW"
+                    user_record["status_code"] = 0
+                    user_record["rejection_reasons"].append("gender_mismatch")
+                    print(f"[{user_id}] → REVIEW (Gender mismatch)")
+                elif face_gender_match == True and 0 < face_similarity_score < 60:
+                    user_record["status"] = "REVIEW"
+                    user_record["final_decision"] = "REVIEW"
+                    user_record["status_code"] = 0
+                    user_record["rejection_reasons"].append(f"low_similarity_{face_similarity_score}%")
+                    print(f"[{user_id}] → REVIEW (Low similarity)")
                 
-                user_record["selfie_gender"] = detected_gender
-                user_record["gender_confidence"] = confidence
-                
-                aadhaar_gender = user_record["aadhaar_gender"].lower()
-                selfie_gender = detected_gender.lower()
-                
-                if aadhaar_gender and selfie_gender in ['male', 'female']:
-                    if aadhaar_gender == selfie_gender:
-                        user_record["gender_match"] = True
-                        print(f"[{user_id}] ✅ Gender MATCH: {detected_gender}")
-                    else:
-                        user_record["gender_match"] = False
-                        user_record["rejection_reasons"].append(f"gender_mismatch_aadhaar_{aadhaar_gender}_selfie_{selfie_gender}")
-                        print(f"[{user_id}] ⚠️ Gender MISMATCH: Aadhaar={aadhaar_gender}, Selfie={selfie_gender}")
-                else:
-                    user_record["error_log"] += "Gender comparison failed (missing data); "
-            else:
-                user_record["error_log"] += "No face detected in selfie; "
-                user_record["rejection_reasons"].append("no_face_detected_in_selfie")
         except Exception as e:
-            user_record["error_log"] += f"Gender detection exception: {str(e)}; "
-            print(f"[{user_id}] ❌ Gender detection exception: {e}")
-        finally:
-            # Clean up temp file if we created one
-            if temp_selfie_path and os.path.exists(temp_selfie_path):
-                try:
-                    os.unlink(temp_selfie_path)
-                except:
-                    pass
-    
-    # Step 4: Final Decision
-    if not user_record["aadhaar_found"]:
-        user_record.update({"status": "REJECTED", "final_decision": "REJECTED", "status_code": 1, "score": 0})
-        user_record["rejection_reasons"].append("aadhaar_not_found")
-    elif not user_record["gender_match"] and user_record["selfie_gender"]:
-        user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 50})
-    elif user_record["aadhaar_found"] and user_record["gender_match"]:
-        user_record.update({"status": "APPROVED", "final_decision": "APPROVED", "status_code": 2, "score": 100})
-        print(f"[{user_id}] → APPROVED")
+            print(f"[{user_id}] ❌ Scoring exception: {e}")
+            user_record["error_log"] += f"Scoring exception: {str(e)}; "
+            user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
+            user_record["rejection_reasons"].append("scoring_error")
     else:
-        user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 50})
-        user_record["rejection_reasons"].append("incomplete_verification")
+        # Fallback if scorer not initialized
+        print(f"[{user_id}] ⚠️ VerificationScorer not initialized, using fallback")
+        user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
+        user_record["rejection_reasons"].append("scorer_not_initialized")
     
     user_record["extracted_data"] = {
         "aadhaar": user_record["aadhaar_number"],
+        "name": user_record["aadhaar_name"],
         "dob": user_record["aadhaar_dob"],
+        "address": user_record["aadhaar_address"],
         "gender": user_record["aadhaar_gender"]
-    }
-    user_record["breakdown"] = {
-        "gender_match": user_record["gender_match"],
-        "aadhaar_extracted": user_record["aadhaar_found"],
-        "pan_extracted": user_record["pan_found"]
     }
     
     return user_record
@@ -557,7 +646,21 @@ async def start_batch_verification(req: BatchVerifyRequest, background_tasks: Ba
 
 @app.post("/verification/verify")
 async def verify_user(req: VerifyRequest):
-    """Verify a single user - OPTIMIZED to use in-memory processing"""
+    """Verify a single user - Returns CLEAN JSON (Production)"""
+    return await _run_verification(req, debug=False)
+
+@app.post("/verification/verify/debug")
+async def verify_user_debug(req: VerifyRequest):
+    """Verify a single user - Returns FULL VERBOSE JSON (Debug)"""
+    return await _run_verification(req, debug=True)
+
+@app.post("/verification/verify/agent/")
+async def verify_user_production(req: VerifyRequest):
+    """Production Endpoint - Returns CLEAN JSON"""
+    return await _run_verification(req, debug=False)
+
+async def _run_verification(req: VerifyRequest, debug: bool = False):
+    """Internal helper to run verification and strictly filter response if not debug"""
     user_id = str(req.user_id)
     
     try:
@@ -590,6 +693,11 @@ async def verify_user(req: VerifyRequest):
         
         # Verify user passing memory objects
         result = await verify_single_user(user_id, images, req.dob, req.gender)
+        
+        # Filter response if not debug
+        if not debug:
+            return _filter_response(result)
+        
         return result
         
     except Exception as e:
@@ -599,9 +707,17 @@ async def verify_user(req: VerifyRequest):
     finally:
         gc.collect()
 
-@app.post("/verification/verify/agent/")
-async def verify_user_production(req: VerifyRequest):
-    return await verify_user(req)
+def _filter_response(full_record: dict) -> dict:
+    """Filter the response to only include essential fields for the API (Production)"""
+    return {
+        "user_id": full_record.get("user_id"),
+        "status": full_record.get("status"),
+        "final_decision": full_record.get("final_decision"),
+        "status_code": full_record.get("status_code"),
+        "score": full_record.get("score"),
+        "rejection_reasons": full_record.get("rejection_reasons", []),
+        "extracted_data": full_record.get("extracted_data", {})
+    }
 
 @app.get("/batch/progress")
 async def get_batch_progress():
