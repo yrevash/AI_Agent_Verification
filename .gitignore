@@ -60,3 +60,4 @@ aadhaar_records.pkl
 app/.ipynb_checkpoints/
 app/backup/.ipynb_checkpoints/
 README.md
+local_kyc_data.db
