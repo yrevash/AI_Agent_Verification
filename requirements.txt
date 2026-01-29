@@ -44,3 +44,14 @@ psutil
 # TensorFlow (locked)
 tensorflow
 tf-keras
+
+
+
+pyaadhaar
+opencv-python-headless
+python-multipart
+qreader
+
+opencv-contrib-python
+zxing-cpp
+
