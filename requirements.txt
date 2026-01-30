@@ -34,6 +34,9 @@ accelerate
 transformers
 qwen-vl-utils
 
+# Encryption
+cryptography
+
 # Infra / misc
 redis
 cloudscraper

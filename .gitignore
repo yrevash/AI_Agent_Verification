@@ -1,4 +1,6 @@
 local_kyc_data.db
+data/encrypted_logs/
+data/encryption.key
 cuda-keyring_1.1-1_all.deb
 cuda-keyring_1.1-1_all.deb.1
 cuda_11.8.0_520.61.05_linux.run
@@ -61,3 +63,6 @@ app/.ipynb_checkpoints/
 app/backup/.ipynb_checkpoints/
 README.md
 local_kyc_data.db
+app/model/
+app/extracted_data/
+*.md

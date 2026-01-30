@@ -48,6 +48,10 @@ class AppConfig(BaseModel):
     
     # Database
     aadhaar_db_path: str = Field(default="data/aadhaar_records.pkl", env="AADHAAR_DB_PATH")
+
+    # Encrypted logging
+    encrypted_logs_dir: str = Field(default="data/encrypted_logs", env="ENCRYPTED_LOGS_DIR")
+    encryption_key_path: str = Field(default="data/encryption.key", env="ENCRYPTION_KEY_PATH")
     
     # Performance tuning
     cleanup_interval: int = Field(default=120, env="CLEANUP_INTERVAL")  # seconds
@@ -83,6 +87,8 @@ class Config:
             enable_qwen_fallback=os.getenv("ENABLE_QWEN_FALLBACK", "true").lower() == "true",
             enable_debug_images=os.getenv("ENABLE_DEBUG_IMAGES", "false").lower() == "true",
             aadhaar_db_path=os.getenv("AADHAAR_DB_PATH", "data/aadhaar_records.pkl"),
+            encrypted_logs_dir=os.getenv("ENCRYPTED_LOGS_DIR", "data/encrypted_logs"),
+            encryption_key_path=os.getenv("ENCRYPTION_KEY_PATH", "data/encryption.key"),
             cleanup_interval=int(os.getenv("CLEANUP_INTERVAL", "120")),
             temp_file_ttl=int(os.getenv("TEMP_FILE_TTL", "300")),
             http_timeout=int(os.getenv("HTTP_TIMEOUT", "30"))

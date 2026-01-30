@@ -10,6 +10,7 @@ import traceback
 import json
 import glob
 import tempfile  # Added for temporary file handling
+import re
 from pathlib import Path
 from typing import Optional, Union, List, Dict
 from contextlib import asynccontextmanager
@@ -23,14 +24,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# --- IMPORTS ---
-try:
-    from app.gender_pipeline import GenderPipeline
-except ImportError as e:
-    print(f"ImportError: {e}")
-    # allowing to fail if not present, but logged
-    pass
-
 import requests
 import base64
 from PIL import Image
@@ -40,12 +33,12 @@ from scoring import VerificationScorer
 # --- Ollama Qwen Agent ---
 class OllamaQwenAgent:
     """Ollama-based Qwen agent for document extraction using qwen3-vl:8b-instruct"""
-    
+
     def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", model: str = "qwen3-vl:8b-instruct"):
         self.ollama_url = ollama_url
         self.model = model
         print(f"Initialized Ollama Qwen Agent with model: {model}")
-    
+
     def _image_to_base64(self, image_input: Union[str, io.BytesIO]) -> str:
         """
         Convert image to base64 string with OPTIMIZED RESIZING.
@@ -59,6 +52,8 @@ class OllamaQwenAgent:
                 img = Image.open(image_input)
             else:
                 # Assuming io.BytesIO or bytes
+                if isinstance(image_input, io.BytesIO):
+                    image_input.seek(0)
                 img = Image.open(image_input)
 
             # --- OPTIMIZATION 1: RESIZING ---
@@ -69,20 +64,20 @@ class OllamaQwenAgent:
                 ratio = min(max_size / width, max_size / height)
                 new_size = (int(width * ratio), int(height * ratio))
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
-            
+
             # Convert to RGB (standardize format)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            
+
             # Save to buffer as JPEG
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=85)
             return base64.b64encode(buffer.getvalue()).decode('utf-8')
-            
+
         except Exception as e:
             print(f"Error processing image for base64: {e}")
             return ""
-    
+
     def _call_ollama(self, prompt: str, images: list) -> str:
         """Call Ollama API with vision model"""
         payload = {
@@ -95,20 +90,84 @@ class OllamaQwenAgent:
                 "num_predict": 512
             }
         }
-        
+
         response = requests.post(self.ollama_url, json=payload, timeout=120)
         response.raise_for_status()
         return response.json().get("response", "")
-    
+
+    def validate_aadhaar_front(self, image_input: Union[str, io.BytesIO]) -> dict:
+        """Check if the image is an Aadhaar card front side."""
+        try:
+            img_b64 = self._image_to_base64(image_input)
+            if not img_b64:
+                return {"is_aadhaar_front": False, "reason": "Image processing failed"}
+
+            prompt = """Look at this image carefully. Is this the FRONT side of an Indian Aadhaar card?
+
+The front of an Aadhaar card typically contains:
+- A photo of the person
+- Name
+- Date of Birth
+- Gender
+- Aadhaar number (12 digits)
+- Government of India / UIDAI logo
+
+Return ONLY in this exact JSON format:
+{
+  "is_aadhaar_front": true,
+  "reason": "short reason"
+}
+
+Do not include any explanation, only return the JSON."""
+
+            response_text = self._call_ollama(prompt, [img_b64])
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"is_aadhaar_front": False, "reason": "Failed to parse validation response"}
+        except Exception as e:
+            return {"is_aadhaar_front": False, "reason": str(e)}
+
+    def validate_aadhaar_back(self, image_input: Union[str, io.BytesIO]) -> dict:
+        """Check if the image is an Aadhaar card back side."""
+        try:
+            img_b64 = self._image_to_base64(image_input)
+            if not img_b64:
+                return {"is_aadhaar_back": False, "reason": "Image processing failed"}
+
+            prompt = """Look at this image carefully. Is this the BACK side of an Indian Aadhaar card?
+
+The back of an Aadhaar card typically contains:
+- Address
+- QR code
+- Aadhaar number (12 digits)
+- VID number (may or may not be present)
+
+Return ONLY in this exact JSON format:
+{
+  "is_aadhaar_back": true,
+  "reason": "short reason"
+}
+
+Do not include any explanation, only return the JSON."""
+
+            response_text = self._call_ollama(prompt, [img_b64])
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"is_aadhaar_back": False, "reason": "Failed to parse validation response"}
+        except Exception as e:
+            return {"is_aadhaar_back": False, "reason": str(e)}
+
     def extract_aadhaar_data(self, front_image: Union[str, io.BytesIO], back_image: Union[str, io.BytesIO]) -> dict:
-        """Extract Aadhaar data from front and back images"""
+        """Extract Aadhaar data from front and back images (legacy combined method)"""
         try:
             # Convert images to base64
             front_b64 = self._image_to_base64(front_image)
             back_b64 = self._image_to_base64(back_image)
-            
+
             if not front_b64: return {"error": "Front image processing failed"}
-            
+
             prompt = """Analyze these Aadhaar card images (front and back) and extract the following information:
 
 1. Aadhaar Number (12 digits)
@@ -133,65 +192,163 @@ Return ONLY in this exact JSON format:
 If any field is not clearly visible, use empty string "". Do not include any explanation, only return the JSON."""
 
             response_text = self._call_ollama(prompt, [front_b64, back_b64] if back_b64 else [front_b64])
-            
+
             # Parse JSON from response
-            import re
             json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
             if json_match:
-                import json
                 data = json.loads(json_match.group())
                 return data
             else:
                 return {"error": "Failed to parse response"}
-                
+
         except Exception as e:
             return {"error": str(e)}
-    
-    def extract_pancard_data(self, image_input: Union[str, io.BytesIO]) -> dict:
-        """Extract PAN card data from image"""
-        try:
-            # Convert image to base64
-            img_b64 = self._image_to_base64(image_input)
-            
-            if not img_b64: return {"error": "Image processing failed"}
-            
-            prompt = """Analyze this PAN card image and extract the following information:
 
-1. PAN Number (10 characters)
+    def extract_aadhaar_front(self, front_image: Union[str, io.BytesIO]) -> dict:
+        """Extract data from Aadhaar FRONT image only: number, name, dob, gender, vid, is_masked"""
+        try:
+            front_b64 = self._image_to_base64(front_image)
+            if not front_b64:
+                return {"error": "Front image processing failed"}
+
+            prompt = """Analyze this Aadhaar card FRONT image and extract the following information:
+
+1. Aadhaar Number (12 digits, usually at the bottom of the card)
 2. Name
-3. Father's Name
-4. Date of Birth
+3. Date of Birth (DOB)
+4. Gender/Sex
+5. VID Number (16 digits, if visible - Virtual ID printed below or near Aadhaar number)
+6. Is this a Masked Aadhaar? (Look for 'X' or '*' in the first 8 digits of the number)
 
 Return ONLY in this exact JSON format:
 {
-  "pan_number": "ABCDE1234F",
+  "aadharnumber": "123456789012",
   "name": "Full Name",
-  "father_name": "Father Name",
-  "dob": "DD/MM/YYYY"
+  "dob": "DD/MM/YYYY",
+  "gender": "Male or Female",
+  "vid_number": "1234567890123456",
+  "is_masked": false
 }
 
 If any field is not clearly visible, use empty string "". Do not include any explanation, only return the JSON."""
 
-            response_text = self._call_ollama(prompt, [img_b64])
-            
-            # Parse JSON from response
-            import re
+            response_text = self._call_ollama(prompt, [front_b64])
+
             json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
             if json_match:
-                import json
-                data = json.loads(json_match.group())
-                return data
+                return json.loads(json_match.group())
             else:
-                return {"error": "Failed to parse response"}
-                
+                return {"error": "Failed to parse front response"}
+
         except Exception as e:
             return {"error": str(e)}
 
+    def extract_aadhaar_back(self, back_image: Union[str, io.BytesIO]) -> dict:
+        """Extract data from Aadhaar BACK image only: number, address, pincode, vid, is_masked"""
+        try:
+            back_b64 = self._image_to_base64(back_image)
+            if not back_b64:
+                return {"error": "Back image processing failed"}
+
+            prompt = """Analyze this Aadhaar card BACK image and extract the following information:
+
+1. Aadhaar Number (12 digits, usually at the bottom of the card)
+2. Address (full address text)
+3. Pincode (6 digits, at the end of the address)
+4. VID Number (16 digits, if visible - Virtual ID printed below or near Aadhaar number)
+5. Is this a Masked Aadhaar? (Look for 'X' or '*' in the first 8 digits of the number)
+
+Return ONLY in this exact JSON format:
+{
+  "aadharnumber": "123456789012",
+  "address": "Full Address",
+  "pincode": "123456",
+  "vid_number": "1234567890123456",
+  "is_masked": false
+}
+
+If any field is not clearly visible, use empty string "". Do not include any explanation, only return the JSON."""
+
+            response_text = self._call_ollama(prompt, [back_b64])
+
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            else:
+                return {"error": "Failed to parse back response"}
+
+        except Exception as e:
+            return {"error": str(e)}
+
+def cross_check_aadhaar(front_data: dict, back_data: dict) -> tuple[dict, bool, list]:
+    """
+    Merge front and back Aadhaar data and cross-check Aadhaar numbers and VID numbers.
+
+    Returns:
+        tuple: (merged_data, cross_check_passed, failure_list)
+    """
+    failures = []
+
+    # Merge: front provides name/dob/gender, back provides address/pincode
+    merged = {
+        "aadharnumber": front_data.get("aadharnumber", ""),
+        "name": front_data.get("name", ""),
+        "dob": front_data.get("dob", ""),
+        "gender": front_data.get("gender", ""),
+        "address": back_data.get("address", "") if back_data else "",
+        "pincode": back_data.get("pincode", "") if back_data else "",
+        "vid_number": front_data.get("vid_number", ""),
+        "is_masked": front_data.get("is_masked", False),
+    }
+
+    # If back data has is_masked set, propagate it
+    if back_data and back_data.get("is_masked", False):
+        merged["is_masked"] = True
+
+    if not back_data:
+        # No back image — skip cross-check
+        return merged, True, failures
+
+    # Cross-check Aadhaar numbers
+    front_num = front_data.get("aadharnumber", "").replace(" ", "")
+    back_num = back_data.get("aadharnumber", "").replace(" ", "")
+
+    if front_num and back_num:
+        # Both are 12-digit numbers
+        front_is_valid = len(front_num) == 12 and front_num.isdigit()
+        back_is_valid = len(back_num) == 12 and back_num.isdigit()
+
+        if front_is_valid and back_is_valid:
+            if front_num != back_num:
+                failures.append(f"Aadhaar Number Mismatch (Front: {front_num} vs Back: {back_num})")
+        # If one side is invalid/empty, we don't fail cross-check — just use what we have
+
+    # Cross-check VID numbers
+    front_vid = front_data.get("vid_number", "").replace(" ", "")
+    back_vid = back_data.get("vid_number", "").replace(" ", "") if back_data else ""
+
+    if front_vid and back_vid:
+        front_vid_valid = len(front_vid) == 16 and front_vid.isdigit()
+        back_vid_valid = len(back_vid) == 16 and back_vid.isdigit()
+
+        if front_vid_valid and back_vid_valid:
+            if front_vid != back_vid:
+                failures.append(f"VID Number Mismatch (Front: {front_vid} vs Back: {back_vid})")
+
+    # Use back VID if front VID is empty
+    if not merged["vid_number"] and back_vid:
+        merged["vid_number"] = back_vid
+
+    cross_check_passed = len(failures) == 0
+    return merged, cross_check_passed, failures
+
+
 # --- Global State ---
 qwen_agent = None
-gender_pipeline = None
 http_session = None
 verification_scorer = None
+face_verifier_ready = False
+encrypted_logger = None
 
 TEMP_DIR = Path("batch_temp")
 PROGRESS_FILE = "batch_progress.json"
@@ -211,14 +368,14 @@ batch_progress = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
-    global qwen_agent, gender_pipeline, http_session, verification_scorer
-    
+    global qwen_agent, http_session, verification_scorer, face_verifier_ready, encrypted_logger
+
     # Startup
     TEMP_DIR.mkdir(exist_ok=True)
     print("=" * 70)
     print("    BATCH VERIFICATION SERVER - QWEN POWERED (OPTIMIZED)")
     print("=" * 70)
-    
+
     # Create persistent HTTP session
     connector = aiohttp.TCPConnector(
         limit=50,
@@ -229,7 +386,7 @@ async def lifespan(app: FastAPI):
     )
     timeout = aiohttp.ClientTimeout(total=30, connect=10)
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-    
+
     # Initialize Qwen Agent (primary extraction method - OLLAMA)
     try:
         print("Initializing Ollama Qwen Agent for document extraction...")
@@ -237,43 +394,58 @@ async def lifespan(app: FastAPI):
             ollama_url="http://localhost:11434/api/generate",
             model="qwen3-vl:8b-instruct"
         )
-        print("✅ Ollama Qwen Agent initialized (qwen3-vl:8b-instruct)")
+        print("Ollama Qwen Agent initialized (qwen3-vl:8b-instruct)")
     except Exception as e:
-        print(f"⚠️ Ollama Qwen Agent initialization failed: {e}")
+        print(f"Ollama Qwen Agent initialization failed: {e}")
         import traceback
         traceback.print_exc()
         qwen_agent = None
-    
-    # Initialize Gender Pipeline (for face gender detection)
-    try:
-        print("Initializing GenderPipeline for face verification...")
-        from app.gender_pipeline import GenderPipeline # Import here to ensure it uses the mock if needed
-        gender_pipeline = GenderPipeline()
-        print("✅ GenderPipeline initialized")
-    except Exception as e:
-        print(f"⚠️ GenderPipeline initialization failed: {e}")
-        gender_pipeline = None
-    
+
     # Initialize VerificationScorer
     try:
         print("Initializing VerificationScorer...")
         verification_scorer = VerificationScorer()
-        print("✅ VerificationScorer initialized")
+        print("VerificationScorer initialized")
     except Exception as e:
-        print(f"⚠️ VerificationScorer initialization failed: {e}")
+        print(f"VerificationScorer initialization failed: {e}")
         verification_scorer = None
-    
+
+    # Initialize Encrypted User Logger
+    try:
+        from encrypted_logger import EncryptedUserLogger
+        from config import get_config
+        cfg = get_config()
+        encrypted_logger = EncryptedUserLogger(
+            logs_dir=cfg.app.encrypted_logs_dir,
+            key_path=cfg.app.encryption_key_path,
+        )
+        print("Encrypted User Logger initialized")
+    except Exception as e:
+        print(f"Encrypted User Logger initialization failed: {e}")
+        encrypted_logger = None
+
+    # Initialize Face Detector (YOLOv12 for face embeddings)
+    try:
+        print("Initializing Face Detector (YOLOv12) for face embedding verification...")
+        from app.faceEmbeddings import initialize_face_detector
+        initialize_face_detector()
+        face_verifier_ready = True
+        print("Face Detector initialized")
+    except Exception as e:
+        print(f"Face Detector initialization failed: {e}")
+        face_verifier_ready = False
+
     print("=" * 70)
-    print("✅ BATCH SERVER READY")
+    print("BATCH SERVER READY")
     print("=" * 70)
-    
+
     yield
-    
+
     # Shutdown
     if http_session:
         await http_session.close()
         await asyncio.sleep(0.25)
-    
+
     print("--- BATCH SERVER SHUTDOWN ---")
 
 app = FastAPI(lifespan=lifespan)
@@ -325,30 +497,27 @@ def load_results() -> list:
     return []
 
 def find_images_in_folder(folder_path: Path) -> dict:
-    """Find Aadhaar, PAN, and Selfie images in a user folder."""
+    """Find Aadhaar and Selfie images in a user folder."""
     images = {
         "aadhar_front": None,
         "aadhar_back": None,
-        "pancard": None,
         "selfie": None
     }
-    
+
     exts = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
     all_files = []
     for ext in exts:
         all_files.extend(folder_path.glob(ext))
-    
+
     for file_path in all_files:
         fname = file_path.name.lower()
         if "aadhar_front" in fname or "aadhaar_front" in fname:
             images["aadhar_front"] = str(file_path)
         elif "aadhar_back" in fname or "aadhaar_back" in fname:
             images["aadhar_back"] = str(file_path)
-        elif "pancard" in fname or "pan_card" in fname or fname.startswith("pan"):
-            images["pancard"] = str(file_path)
         elif "selfie" in fname or "profile" in fname:
             images["selfie"] = str(file_path)
-    
+
     return images
 
 # --- OPTIMIZATION 2: IN-MEMORY FETCH ---
@@ -360,7 +529,7 @@ async def fetch_file(session: aiohttp.ClientSession, source: str) -> Optional[io
     try:
         if str(source).startswith(('http://', 'https://')):
             loop = asyncio.get_event_loop()
-            
+
             def download_with_cloudscraper(url: str) -> bytes:
                 scraper = cloudscraper.create_scraper(
                     browser={'browser': 'chrome', 'platform': 'darwin', 'mobile': False}
@@ -372,7 +541,7 @@ async def fetch_file(session: aiohttp.ClientSession, source: str) -> Optional[io
                 finally:
                     if hasattr(scraper, 'close'):
                         scraper.close()
-            
+
             content = await loop.run_in_executor(None, download_with_cloudscraper, str(source))
             return io.BytesIO(content)
         else:
@@ -386,7 +555,7 @@ async def fetch_file(session: aiohttp.ClientSession, source: str) -> Optional[io
 
 async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[str] = None, expected_gender: Optional[str] = None) -> dict:
     """
-    Verify a single user. 
+    Verify a single user.
     Images dict can contain file paths (str) or in-memory objects (io.BytesIO).
     """
     user_record = {
@@ -397,153 +566,200 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
         "score": 0,
         "aadhaar_found": False,
         "aadhaar_number": "", "aadhaar_name": "", "aadhaar_dob": "", "aadhaar_gender": "", "aadhaar_address": "", "aadhaar_pincode": "",
-        "gender_match": False,
         "extracted_data": {},
-        "input_data": { "dob": expected_dob, "gender": expected_gender },
+        "input_data": { "dob": expected_dob },
         "rejection_reasons": [], "error_log": ""
     }
-    
+
     if not qwen_agent:
         user_record.update({"status": "ERROR", "final_decision": "SYSTEM_ERROR", "status_code": -1, "reason": "Qwen agent not initialized"})
         return user_record
-    
+
     loop = asyncio.get_event_loop()
-    
-    # Step 1: Extract Aadhaar data using Qwen (Handles paths or BytesIO internally now)
-    if images.get("aadhar_front"):
-        try:
-            print(f"[{user_id}] Extracting Aadhaar with Qwen...")
-            aadhaar_data = await loop.run_in_executor(
-                None,
-                qwen_agent.extract_aadhaar_data,
-                images["aadhar_front"],
-                images.get("aadhar_back") # Pass back image if exists
-            )
-            
-            if aadhaar_data and "error" not in aadhaar_data:
-                # Check for Masked Aadhaar
-                is_masked = aadhaar_data.get("is_masked", False)
-                
-                # Double check for masking in the number string itself
-                aadhar_num = aadhaar_data.get("aadharnumber", "")
-                if "X" in aadhar_num.upper() or "*" in aadhar_num:
-                    is_masked = True
 
-                if is_masked:
-                     user_record["status"] = "REJECTED"
-                     user_record["final_decision"] = "REJECTED"
-                     user_record["status_code"] = 1
-                     user_record["rejection_reasons"].append("aadhaar_masked")
-                     user_record["aadhaar_found"] = True # It was found, just rejected
-                     user_record["error_log"] += "Masked Aadhaar detected; "
-                     print(f"[{user_id}] ❌ REJECTED: Masked Aadhaar detected")
-                else:
-                    user_record["aadhaar_found"] = True
-                    user_record["aadhaar_number"] = aadhar_num
-                    user_record["aadhaar_name"] = aadhaar_data.get("name", "")
-                    user_record["aadhaar_dob"] = aadhaar_data.get("dob", "")
-                    user_record["aadhaar_gender"] = aadhaar_data.get("gender", "")
-                    user_record["aadhaar_address"] = aadhaar_data.get("address", "")
-                    user_record["aadhaar_pincode"] = aadhaar_data.get("pincode", "")
-                    print(f"[{user_id}] ✅ Aadhaar extracted - Gender: {user_record['aadhaar_gender']}")
-            else:
-                error_msg = aadhaar_data.get("error", "Unknown error") if aadhaar_data else "No response"
-                user_record["error_log"] += f"Aadhaar extraction failed: {error_msg}; "
-                user_record["rejection_reasons"].append("aadhaar_extraction_failed")
-        except Exception as e:
-            user_record["error_log"] += f"Aadhaar exception: {str(e)}; "
-            user_record["rejection_reasons"].append("aadhaar_processing_error")
-            print(f"[{user_id}] ❌ Aadhaar exception: {e}")
-    
-    # Step 2: Extract PAN data using Qwen (if available)
-    if images.get("pancard"):
-        try:
-            print(f"[{user_id}] Extracting PAN with Qwen...")
-            pan_data = await loop.run_in_executor(
-                None,
-                qwen_agent.extract_pancard_data,
-                images["pancard"]
-            )
-            
-            if pan_data and "error" not in pan_data and pan_data.get("pan_number"):
-                user_record["pan_found"] = True
-                user_record["pan_number"] = pan_data.get("pan_number", "")
-                user_record["pan_name"] = pan_data.get("name", "")
-                user_record["pan_father_name"] = pan_data.get("father_name", "")
-                user_record["pan_dob"] = pan_data.get("dob", "")
-                print(f"[{user_id}] ✅ PAN extracted")
-            else:
-                error_msg = pan_data.get("error", "Unknown error") if pan_data else "No response"
-                user_record["error_log"] += f"PAN extraction failed: {error_msg}; "
-        except Exception as e:
-            user_record["error_log"] += f"PAN exception: {str(e)}; "
+    # ========================================================================
+    # Step 1: Extract Aadhaar data — separate front/back with cross-check
+    # ========================================================================
+    cross_check_failures = []
+    vid_number = ""
+    aadhaar_cross_check_passed = True
 
-    
-    # Step 3: Qwen-based Selfie Gender Detection (before scoring)
-    face_gender_match = None
-    if images.get("selfie") and qwen_agent and user_record["aadhaar_gender"]:
+    # Both front and back are required
+    if not images.get("aadhar_front") or not images.get("aadhar_back"):
+        missing = []
+        if not images.get("aadhar_front"): missing.append("aadhar_front")
+        if not images.get("aadhar_back"): missing.append("aadhar_back")
+        user_record.update({
+            "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+            "rejection_reasons": [f"missing_{m}" for m in missing],
+            "error_log": f"Missing required images: {', '.join(missing)}"
+        })
+        print(f"[{user_id}] REJECTED: Missing {', '.join(missing)}")
+        return user_record
+
+    try:
+        # Validate FRONT — is this actually an Aadhaar front?
+        print(f"[{user_id}] Validating Aadhaar FRONT image...")
+        front_validation = await loop.run_in_executor(
+            None,
+            qwen_agent.validate_aadhaar_front,
+            images["aadhar_front"]
+        )
+        if not front_validation.get("is_aadhaar_front"):
+            reason = front_validation.get("reason", "Not an Aadhaar front")
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["not_aadhaar_front"],
+                "error_log": f"Image is not Aadhaar FRONT: {reason}"
+            })
+            print(f"[{user_id}] REJECTED: Image is not Aadhaar FRONT — {reason}")
+            return user_record
+
+        # Validate BACK — is this actually an Aadhaar back?
+        print(f"[{user_id}] Validating Aadhaar BACK image...")
+        back_validation = await loop.run_in_executor(
+            None,
+            qwen_agent.validate_aadhaar_back,
+            images["aadhar_back"]
+        )
+        if not back_validation.get("is_aadhaar_back"):
+            reason = back_validation.get("reason", "Not an Aadhaar back")
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["not_aadhaar_back"],
+                "error_log": f"Image is not Aadhaar BACK: {reason}"
+            })
+            print(f"[{user_id}] REJECTED: Image is not Aadhaar BACK — {reason}")
+            return user_record
+
+        # Extract FRONT
+        print(f"[{user_id}] Extracting Aadhaar FRONT with Qwen...")
+        front_data = await loop.run_in_executor(
+            None,
+            qwen_agent.extract_aadhaar_front,
+            images["aadhar_front"]
+        )
+        if not front_data or "error" in front_data:
+            error_msg = front_data.get("error", "Unknown error") if front_data else "No response"
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["aadhaar_front_extraction_failed"],
+                "error_log": f"Aadhaar FRONT extraction failed: {error_msg}"
+            })
+            print(f"[{user_id}] REJECTED: Aadhaar FRONT extraction failed")
+            return user_record
+
+        # Extract BACK
+        print(f"[{user_id}] Extracting Aadhaar BACK with Qwen...")
+        back_data = await loop.run_in_executor(
+            None,
+            qwen_agent.extract_aadhaar_back,
+            images["aadhar_back"]
+        )
+        if not back_data or "error" in back_data:
+            error_msg = back_data.get("error", "Unknown error") if back_data else "No response"
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["aadhaar_back_extraction_failed"],
+                "error_log": f"Aadhaar BACK extraction failed: {error_msg}"
+            })
+            print(f"[{user_id}] REJECTED: Aadhaar BACK extraction failed")
+            return user_record
+
+        # Cross-check front and back
+        aadhaar_data, aadhaar_cross_check_passed, cross_check_failures = cross_check_aadhaar(
+            front_data, back_data
+        )
+
+        if cross_check_failures:
+            user_record["rejection_reasons"].extend(
+                [f"cross_check: {f}" for f in cross_check_failures]
+            )
+            print(f"[{user_id}] Cross-check failures: {cross_check_failures}")
+
+        # Check for Masked Aadhaar
+        is_masked = aadhaar_data.get("is_masked", False)
+        aadhar_num = aadhaar_data.get("aadharnumber", "")
+        if "X" in aadhar_num.upper() or "*" in aadhar_num:
+            is_masked = True
+
+        vid_number = aadhaar_data.get("vid_number", "")
+
+        if is_masked:
+            user_record["status"] = "REJECTED"
+            user_record["final_decision"] = "REJECTED"
+            user_record["status_code"] = 1
+            user_record["rejection_reasons"].append("aadhaar_masked")
+            user_record["aadhaar_found"] = True
+            user_record["error_log"] += "Masked Aadhaar detected; "
+            print(f"[{user_id}] REJECTED: Masked Aadhaar detected")
+            return user_record
+        else:
+            user_record["aadhaar_found"] = True
+            user_record["aadhaar_number"] = aadhar_num
+            user_record["aadhaar_name"] = aadhaar_data.get("name", "")
+            user_record["aadhaar_dob"] = aadhaar_data.get("dob", "")
+            user_record["aadhaar_gender"] = aadhaar_data.get("gender", "")
+            user_record["aadhaar_address"] = aadhaar_data.get("address", "")
+            user_record["aadhaar_pincode"] = aadhaar_data.get("pincode", "")
+            print(f"[{user_id}] Aadhaar extracted - Gender: {user_record['aadhaar_gender']}")
+
+    except Exception as e:
+        user_record.update({
+            "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+            "rejection_reasons": ["aadhaar_processing_error"],
+            "error_log": f"Aadhaar exception: {str(e)}"
+        })
+        print(f"[{user_id}] REJECTED: Aadhaar exception: {e}")
+        return user_record
+
+    # ========================================================================
+    # Step 2: Face Embedding Verification (YOLOv12 + DeepFace)
+    # ========================================================================
+    face_verification_result = None
+    if images.get("selfie") and images.get("aadhar_front") and face_verifier_ready:
         try:
-            print(f"[{user_id}] Detecting gender from selfie using Qwen...")
-            
+            print(f"[{user_id}] Running face embedding verification (YOLOv12 + DeepFace)...")
+            from app.faceEmbeddings import verify_faces_memory
+
+            # Seek to beginning of BytesIO objects before passing
             selfie_input = images["selfie"]
-            gender_prompt = """Analyze this selfie image and determine the person's gender.
-            
-Return ONLY in this exact JSON format:
-{
-  "gender": "Male or Female",
-  "confidence": "High or Medium or Low"
-}
+            aadhaar_input = images["aadhar_front"]
+            if isinstance(selfie_input, io.BytesIO):
+                selfie_input.seek(0)
+            if isinstance(aadhaar_input, io.BytesIO):
+                aadhaar_input.seek(0)
 
-Do not include any explanation, only return the JSON."""
-            
-            selfie_b64 = qwen_agent._image_to_base64(selfie_input)
-            
-            if selfie_b64:
-                response_text = qwen_agent._call_ollama(gender_prompt, [selfie_b64])
-                import re
-                json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
-                if json_match:
-                    import json
-                    gender_data = json.loads(json_match.group())
-                    selfie_gender = gender_data.get("gender", "").strip()
-                    confidence = gender_data.get("confidence", "Low")
-                    
-                    print(f"[{user_id}] 📷 Selfie gender: {selfie_gender} (confidence: {confidence})")
-                    
-                    aadhaar_gender = user_record["aadhaar_gender"].lower()
-                    selfie_gender_normalized = selfie_gender.lower()
-                    
-                    if aadhaar_gender and selfie_gender_normalized in ['male', 'female']:
-                        if aadhaar_gender == selfie_gender_normalized:
-                            face_gender_match = True
-                            print(f"[{user_id}] ✅ Selfie gender matches Aadhaar")
-                        else:
-                            face_gender_match = False
-                            print(f"[{user_id}] ⚠️ Selfie gender mismatch")
-                
+            face_verification_result = await loop.run_in_executor(
+                None,
+                verify_faces_memory,
+                selfie_input,
+                aadhaar_input,
+                str(user_id)
+            )
+
+            face_sim = face_verification_result.get("similarity_score", 0.0)
+            face_verified = face_verification_result.get("verified", False)
+            is_duplicate = face_verification_result.get("is_duplicate", False)
+            face_error = face_verification_result.get("error")
+
+            print(f"[{user_id}] Face similarity: {face_sim}, verified: {face_verified}, duplicate: {is_duplicate}")
+
+            if is_duplicate:
+                dup_user = face_verification_result.get("duplicate_user_id", "unknown")
+                user_record["rejection_reasons"].append(f"duplicate_face_matches_{dup_user}")
+                print(f"[{user_id}] DUPLICATE FACE detected (matches {dup_user})")
+
+            if face_error and not face_verified:
+                user_record["error_log"] += f"Face verification: {face_error}; "
+
         except Exception as e:
-            print(f"[{user_id}] ⚠️ Selfie gender detection failed: {e}")
-            user_record["error_log"] += f"Selfie gender detection failed: {str(e)}; "
-    
-    # Step 3b: Qwen Face Similarity
-    face_similarity_score = 0
-    if images.get("selfie") and images.get("aadhar_front") and qwen_agent:
-        try:
-            print(f"[{user_id}] Checking face similarity...")
-            prompt = """Compare these images. Same person? Return JSON: {"similarity_percentage": 0-100}"""
-            s_b64 = qwen_agent._image_to_base64(images["selfie"])
-            a_b64 = qwen_agent._image_to_base64(images["aadhar_front"])
-            if s_b64 and a_b64:
-                resp = qwen_agent._call_ollama(prompt, [s_b64, a_b64])
-                import re, json
-                m = re.search(r'\{[^}]+\}', resp, re.DOTALL)
-                if m:
-                    face_similarity_score = json.loads(m.group()).get("similarity_percentage", 0)
-                    print(f"[{user_id}] Similarity: {face_similarity_score}%")
-        except Exception as e:
-            print(f"[{user_id}] Similarity check failed: {e}")
-    
+            print(f"[{user_id}] Face embedding verification failed: {e}")
+            user_record["error_log"] += f"Face embedding exception: {str(e)}; "
+
+    # ========================================================================
     # Step 3: Calculate Score using VerificationScorer
+    # ========================================================================
     if verification_scorer:
         try:
             # Prepare entity_data in the format expected by scoring.py
@@ -555,80 +771,94 @@ Do not include any explanation, only return the JSON."""
                 "address": user_record["aadhaar_address"],
                 "age_status": "age_approved"  # We don't have age validation yet, assume approved if DOB extracted
             }
-            
-            # Face data (not implemented yet, set to 0)
-            face_data = {"score": 0}
-            
+
             # Calculate score using VerificationScorer
             scoring_result = verification_scorer.calculate_score(
-                face_data=face_data,
                 entity_data=entity_data,
-                expected_gender=expected_gender,
                 expected_dob=expected_dob,
-                qwen_face_result=None,
-                face_gender_match=face_gender_match  # Pass selfie gender match result
+                face_verification_result=face_verification_result,
+                cross_check_failures=cross_check_failures if cross_check_failures else None
             )
-            
+
             # Extract results
             final_score = scoring_result["total_score"]
             final_status = scoring_result["status"]
             breakdown = scoring_result["breakdown"]
             rejection_reasons = scoring_result["rejection_reasons"]
-            
+
             # Update user_record with scoring results
             user_record["score"] = final_score
             user_record["status"] = final_status
             user_record["final_decision"] = final_status
-            
+
             # Map status to status_code
             status_code_map = {"APPROVED": 2, "REVIEW": 0, "REJECTED": 1}
             user_record["status_code"] = status_code_map.get(final_status, 0)
-            
+
             # Add rejection reasons
             user_record["rejection_reasons"].extend(rejection_reasons)
-            
-            # Update gender_match based on breakdown
-            if "gender_score" in breakdown:
-                user_record["gender_match"] = breakdown["gender_score"] > 0
-            
-            print(f"[{user_id}] → {final_status} (Score: {final_score})")
+
+            print(f"[{user_id}] -> {final_status} (Score: {final_score})")
             if rejection_reasons:
                 print(f"[{user_id}] Rejection Reasons: {', '.join(rejection_reasons)}")
-            
-            # Override: Gender mismatch or low similarity → REVIEW
+
+            # Post-scoring overrides
             if final_status != "REJECTED":
-                if face_gender_match == False:
-                    user_record["status"] = "REVIEW"
-                    user_record["final_decision"] = "REVIEW"
-                    user_record["status_code"] = 0
-                    user_record["rejection_reasons"].append("gender_mismatch")
-                    print(f"[{user_id}] → REVIEW (Gender mismatch)")
-                elif face_gender_match == True and 0 < face_similarity_score < 60:
-                    user_record["status"] = "REVIEW"
-                    user_record["final_decision"] = "REVIEW"
-                    user_record["status_code"] = 0
-                    user_record["rejection_reasons"].append(f"low_similarity_{face_similarity_score}%")
-                    print(f"[{user_id}] → REVIEW (Low similarity)")
-                
+                if face_verification_result and not face_verification_result.get("verified", False):
+                    face_error = face_verification_result.get("error")
+                    similarity = float(face_verification_result.get("similarity_score", 0.0))
+
+                    if face_error and "No face detected" in face_error:
+                        # No face found in one of the images
+                        user_record["status"] = "REVIEW"
+                        user_record["final_decision"] = "REVIEW"
+                        user_record["status_code"] = 0
+                        user_record["rejection_reasons"].append("no_face_detected")
+                        print(f"[{user_id}] -> REVIEW (No face detected)")
+                    elif similarity >= 0.4:
+                        # Close to threshold — send for human review (e.g. age gap, facial hair)
+                        user_record["status"] = "REVIEW"
+                        user_record["final_decision"] = "REVIEW"
+                        user_record["status_code"] = 0
+                        user_record["rejection_reasons"].append(f"face_similarity_low_{similarity:.4f}")
+                        print(f"[{user_id}] -> REVIEW (Face similarity {similarity:.4f} below threshold but close)")
+                    else:
+                        # Very low similarity — reject
+                        user_record["status"] = "REJECTED"
+                        user_record["final_decision"] = "REJECTED"
+                        user_record["status_code"] = 1
+                        user_record["rejection_reasons"].append(f"face_not_verified_{similarity:.4f}")
+                        print(f"[{user_id}] -> REJECTED (Face similarity {similarity:.4f} too low)")
+
         except Exception as e:
-            print(f"[{user_id}] ❌ Scoring exception: {e}")
+            print(f"[{user_id}] Scoring exception: {e}")
             user_record["error_log"] += f"Scoring exception: {str(e)}; "
             user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
             user_record["rejection_reasons"].append("scoring_error")
     else:
         # Fallback if scorer not initialized
-        print(f"[{user_id}] ⚠️ VerificationScorer not initialized, using fallback")
+        print(f"[{user_id}] VerificationScorer not initialized, using fallback")
         user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
         user_record["rejection_reasons"].append("scorer_not_initialized")
-    
+
+    # ========================================================================
+    # Step 4: Build extracted_data (enriched)
+    # ========================================================================
     user_record["extracted_data"] = {
         "aadhaar": user_record["aadhaar_number"],
         "name": user_record["aadhaar_name"],
         "dob": user_record["aadhaar_dob"],
         "address": user_record["aadhaar_address"],
-        "gender": user_record["aadhaar_gender"]
+        "gender": user_record["aadhaar_gender"],
     }
-    
+    user_record["_internal"] = {
+        "vid_number": vid_number,
+        "face_similarity": float(face_verification_result.get("similarity_score", 0.0)) if face_verification_result else 0.0,
+        "face_verified": bool(face_verification_result.get("verified", False)) if face_verification_result else False,
+        "is_duplicate_face": bool(face_verification_result.get("is_duplicate", False)) if face_verification_result else False,
+        "aadhaar_cross_check_passed": bool(aadhaar_cross_check_passed),
+    }
+
     return user_record
 
 # --- API Endpoints ---
@@ -637,10 +867,10 @@ async def start_batch_verification(req: BatchVerifyRequest, background_tasks: Ba
     global batch_processing, batch_progress
     if batch_processing:
         return {"status": "error", "message": "Batch processing already in progress", "progress": batch_progress}
-    
+
     if not os.path.exists(req.dataset_root):
         return {"status": "error", "message": f"Dataset directory not found: {req.dataset_root}"}
-    
+
     background_tasks.add_task(process_batch, req.dataset_root, req.output_dir)
     return {"status": "started", "message": "Batch verification started", "dataset_root": req.dataset_root}
 
@@ -662,7 +892,7 @@ async def verify_user_production(req: VerifyRequest):
 async def _run_verification(req: VerifyRequest, debug: bool = False):
     """Internal helper to run verification and strictly filter response if not debug"""
     user_id = str(req.user_id)
-    
+
     try:
         # Download files directly to memory (No disk I/O)
         print(f"[{user_id}] Fetching images to memory...")
@@ -671,35 +901,46 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
             fetch_file(http_session, req.passport_first),
             fetch_file(http_session, req.passport_old)
         ]
-        
+
         results = await asyncio.gather(*download_tasks, return_exceptions=True)
-        
+
         selfie_img, front_img, back_img = results[0], results[1], results[2]
-        
-        # Check if mandatory files exist
-        if not (selfie_img and front_img): 
+
+        # Check if mandatory files exist (all three required)
+        missing = []
+        if not selfie_img: missing.append("selfie")
+        if not front_img: missing.append("aadhar_front")
+        if not back_img: missing.append("aadhar_back")
+        if missing:
             return {
-                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED", 
-                "status_code": 1, "score": 0, "reason": "File Retrieval Failed",
-                "rejection_reasons": ["file_download_failed"]
+                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
+                "status_code": 1, "score": 0, "reason": f"File Retrieval Failed: {', '.join(missing)}",
+                "rejection_reasons": [f"file_download_failed_{m}" for m in missing]
             }
-        
+
         # Construct images dict with in-memory BytesIO objects
         images = {
             "selfie": selfie_img,
             "aadhar_front": front_img,
             "aadhar_back": back_img
         }
-        
+
         # Verify user passing memory objects
         result = await verify_single_user(user_id, images, req.dob, req.gender)
-        
+
+        # Encrypted audit log
+        if encrypted_logger:
+            try:
+                encrypted_logger.log_user(user_id, result)
+            except Exception as log_err:
+                print(f"[{user_id}] Encrypted logging failed: {log_err}")
+
         # Filter response if not debug
         if not debug:
             return _filter_response(result)
-        
+
         return result
-        
+
     except Exception as e:
         print(f"Error in single verification: {e}")
         traceback.print_exc()
@@ -742,59 +983,89 @@ async def health_check():
         "status": "healthy",
         "components": {
             "qwen_agent": qwen_agent is not None,
-            "gender_pipeline": gender_pipeline is not None
+            "face_verifier": face_verifier_ready,
+            "encrypted_logger": encrypted_logger is not None
         },
         "batch_processing": batch_processing
     }
+
+# --- Audit Endpoints ---
+@app.get("/audit/user/{user_id}")
+async def audit_user(user_id: str):
+    """Decrypt and return a user's encrypted verification log."""
+    if not encrypted_logger:
+        return {"status": "error", "message": "Encrypted logger not initialized"}
+    try:
+        record = encrypted_logger.read_user_log(user_id)
+        return {"status": "ok", "user_id": user_id, "record": record}
+    except FileNotFoundError:
+        return {"status": "not_found", "message": f"No log for user {user_id}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/audit/users")
+async def audit_list_users():
+    """List all user IDs with encrypted logs."""
+    if not encrypted_logger:
+        return {"status": "error", "message": "Encrypted logger not initialized"}
+    users = encrypted_logger.list_logged_users()
+    return {"status": "ok", "count": len(users), "user_ids": users}
 
 # --- Background Processing ---
 async def process_batch(dataset_root: str, output_dir: str):
     """Background task to process entire batch dataset."""
     global batch_processing, batch_results, batch_progress
-    
+
     batch_processing = True
     batch_results = []
-    
+
     try:
         # Find all batch folders
         batch_folders = sorted([f for f in glob.glob(os.path.join(dataset_root, "batch_*")) if os.path.isdir(f)])
-        
+
         if not batch_folders:
             print(f"No batch folders found in {dataset_root}")
             batch_processing = False
             return
-        
+
         # Count total users
         total_users = 0
         for batch_path in batch_folders:
             user_folders = [f for f in glob.glob(os.path.join(batch_path, "*")) if os.path.isdir(f)]
             total_users += len(user_folders)
-        
+
         batch_progress["total"] = total_users
         batch_progress["processed"] = 0
         batch_progress["status"] = "processing"
-        
+
         print(f"Starting batch processing: {len(batch_folders)} batches, {total_users} users")
-        
+
         # Process each batch
         for batch_path in batch_folders:
             batch_name = os.path.basename(batch_path)
             batch_progress["current_batch"] = batch_name
-            
+
             user_folders = [f for f in glob.glob(os.path.join(batch_path, "*")) if os.path.isdir(f)]
-            
+
             for user_path in user_folders:
                 user_id = os.path.basename(user_path)
                 batch_progress["current_user"] = f"{batch_name}/{user_id}"
-                
+
                 try:
                     # Find images (returns file paths as strings)
                     images = find_images_in_folder(Path(user_path))
-                    
+
                     # Verify user
                     result = await verify_single_user(f"{batch_name}_{user_id}", images, None, None)
                     batch_results.append(result)
-                    
+
+                    # Encrypted audit log
+                    if encrypted_logger:
+                        try:
+                            encrypted_logger.log_user(f"{batch_name}_{user_id}", result)
+                        except Exception as log_err:
+                            print(f"[{batch_name}_{user_id}] Encrypted logging failed: {log_err}")
+
                     # Save individual user result immediately
                     user_result_file = Path(output_dir) / "individual_results" / f"{batch_name}_{user_id}.json"
                     user_result_file.parent.mkdir(parents=True, exist_ok=True)
@@ -803,19 +1074,19 @@ async def process_batch(dataset_root: str, output_dir: str):
                             json.dump(result, f, indent=2)
                     except Exception as e:
                         print(f"Failed to save individual result for {user_id}: {e}")
-                    
+
                     # Update progress
                     batch_progress["processed"] += 1
                     batch_progress["last_processed"] = f"{batch_name}_{user_id}"
                     batch_progress["timestamp"] = datetime.now().isoformat()
-                    
+
                     if batch_progress["processed"] % 5 == 0:
                         save_progress(batch_progress)
                         save_results(batch_results)
-                    
+
                     if batch_progress["processed"] % 20 == 0:
                         gc.collect()
-                    
+
                 except Exception as e:
                     print(f"Error processing user {user_id}: {e}")
                     batch_results.append({
@@ -825,33 +1096,33 @@ async def process_batch(dataset_root: str, output_dir: str):
                         "error_log": str(e)
                     })
                     batch_progress["processed"] += 1
-        
+
         # Save final results
         batch_progress["status"] = "completed"
         batch_progress["completion_time"] = datetime.now().isoformat()
         save_progress(batch_progress)
         save_results(batch_results)
-        
+
         if batch_results:
             output_path = Path(output_dir)
             output_path.mkdir(exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+
             comprehensive_data = {
                 "metadata": {"total_users": len(batch_results), "timestamp": timestamp},
                 "users": batch_results
             }
-            
+
             with open(output_path / f"batch_results_complete_{timestamp}.json", 'w') as f:
                 json.dump(comprehensive_data, f, indent=2)
-                
+
             df = pd.DataFrame(batch_results)
             df.to_csv(output_path / f"batch_results_{timestamp}.csv", index=False)
-        
+
         gc.collect()
-        
+
     except Exception as e:
-        print(f"❌ Batch processing error: {e}")
+        print(f"Batch processing error: {e}")
         batch_progress["status"] = "error"
         batch_progress["error"] = str(e)
     finally:
