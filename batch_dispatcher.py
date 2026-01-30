@@ -7,10 +7,26 @@ import os
 from datetime import datetime
 from pathlib import Path
 import gspread
+import cloudscraper
 from dotenv import load_dotenv
 
 # Import Redis cache
 from redis_cache import get_cache
+
+
+def _backend_post(url: str, payload: dict, headers: dict, timeout: int = 25) -> dict:
+    """Make a POST request to the backend using cloudscraper to bypass Cloudflare."""
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'darwin', 'mobile': False}
+    )
+    try:
+        # Update scraper's session headers so they persist across redirects
+        scraper.headers.update(headers)
+        resp = scraper.post(url, json=payload, headers=headers, timeout=timeout)
+        return {"status": resp.status_code, "body": resp.text}
+    finally:
+        if hasattr(scraper, 'close'):
+            scraper.close()
 
 # Load environment variables
 load_dotenv()
@@ -48,7 +64,7 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "X-sign-Secret": "QONEQT1607_AI",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Content-Type": "application/json",
     "Origin": "https://qoneqt.com",
@@ -439,29 +455,30 @@ async def lock_batch(session, agent_id, retry_count=0):
         "batch_size": BATCH_SIZE,
         "ttl_hours": TTL_HOURS
     }
-    
+
     try:
-        async with session.post(url, json=payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("success"):
-                    logger.info(f"🔒 Locked {data.get('locked_count')} users for Agent {agent_id}")
-                    return data.get("kyc_ids", [])
-                else:
-                    logger.error(f"Failed to lock batch: {data.get('message')}")
-            elif resp.status == 502 and retry_count < MAX_RETRIES:
-                # Server is down, implement exponential backoff
-                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY  # 5s, 10s, 20s
-                logger.warning(f"⚠️ 502 Bad Gateway for Agent {agent_id}. Server may be down. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
-                await asyncio.sleep(wait_time)
-                return await lock_batch(session, agent_id, retry_count + 1)
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _backend_post, url, payload, HEADERS)
+        status = raw["status"]
+        body = raw["body"]
+
+        if status == 200:
+            data = json.loads(body)
+            if data.get("success"):
+                logger.info(f"🔒 Locked {data.get('locked_count')} users for Agent {agent_id}")
+                return data.get("kyc_ids", [])
             else:
-                error_text = await resp.text()
-                # Only log detailed error if enabled
-                if LOG_502_DETAILS or resp.status != 502:
-                    logger.error(f"API Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
-                else:
-                    logger.error(f"API Error {resp.status} for Agent {agent_id} - Server unavailable")
+                logger.error(f"Failed to lock batch: {data.get('message')}")
+        elif status == 502 and retry_count < MAX_RETRIES:
+            wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
+            logger.warning(f"⚠️ 502 Bad Gateway for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+            await asyncio.sleep(wait_time)
+            return await lock_batch(session, agent_id, retry_count + 1)
+        else:
+            if LOG_502_DETAILS or status != 502:
+                logger.error(f"API Error {status} for Agent {agent_id}: {body[:200]}")
+            else:
+                logger.error(f"API Error {status} for Agent {agent_id} - Server unavailable")
     except asyncio.TimeoutError:
         logger.error(f"⏱️ Timeout locking batch for Agent {agent_id}")
     except Exception as e:
@@ -475,27 +492,30 @@ async def release_batch(session, agent_id, retry_count=0):
         "admin_id": ADMIN_ID,
         "target_admin_id": agent_id
     }
-    
+
     try:
-        async with session.post(url, json=payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("success"):
-                    logger.info(f"🔓 Released batch for Agent {agent_id}")
-                    return True
-                else:
-                    logger.error(f"Failed to release batch for Agent {agent_id}: {data.get('message')}")
-            elif resp.status == 502 and retry_count < MAX_RETRIES:
-                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
-                logger.warning(f"⚠️ 502 Bad Gateway releasing batch for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
-                await asyncio.sleep(wait_time)
-                return await release_batch(session, agent_id, retry_count + 1)
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _backend_post, url, payload, HEADERS)
+        status = raw["status"]
+        body = raw["body"]
+
+        if status == 200:
+            data = json.loads(body)
+            if data.get("success"):
+                logger.info(f"🔓 Released batch for Agent {agent_id}")
+                return True
             else:
-                error_text = await resp.text()
-                if LOG_502_DETAILS or resp.status != 502:
-                    logger.error(f"Release Batch API Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
-                else:
-                    logger.error(f"Release Batch API Error {resp.status} for Agent {agent_id} - Server unavailable")
+                logger.error(f"Failed to release batch for Agent {agent_id}: {data.get('message')}")
+        elif status == 502 and retry_count < MAX_RETRIES:
+            wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
+            logger.warning(f"⚠️ 502 Bad Gateway releasing batch for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+            await asyncio.sleep(wait_time)
+            return await release_batch(session, agent_id, retry_count + 1)
+        else:
+            if LOG_502_DETAILS or status != 502:
+                logger.error(f"Release Batch API Error {status} for Agent {agent_id}: {body[:200]}")
+            else:
+                logger.error(f"Release Batch API Error {status} for Agent {agent_id} - Server unavailable")
     except asyncio.TimeoutError:
         logger.error(f"⏱️ Timeout releasing batch for Agent {agent_id}")
     except Exception as e:
@@ -506,35 +526,38 @@ async def fetch_user_details(session, agent_id, retry_count=0):
     """Step 2: Get details for the assigned users with retry logic"""
     url = f"{BASE_URL}/admin/kyc-my-batch"
     payload = {
-        "admin_id": agent_id, 
+        "admin_id": agent_id,
         "page": 1,
         "only_pending": True,
         "limit": BATCH_SIZE,
-        "statusFilter": "2",  
+        "statusFilter": "2",
         "isFullSearch": True,
         "offset": 0,
         "type": "0",
         "assignment_filter": "assigned"
     }
-    
+
     try:
-        async with session.post(url, json=payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                users = data.get("data", [])
-                logger.info(f"📋 Fetched details for {len(users)} users (Agent {agent_id})")
-                return users
-            elif resp.status == 502 and retry_count < MAX_RETRIES:
-                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
-                logger.warning(f"⚠️ 502 Bad Gateway fetching users for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
-                await asyncio.sleep(wait_time)
-                return await fetch_user_details(session, agent_id, retry_count + 1)
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _backend_post, url, payload, HEADERS)
+        status = raw["status"]
+        body = raw["body"]
+
+        if status == 200:
+            data = json.loads(body)
+            users = data.get("data", [])
+            logger.info(f"📋 Fetched details for {len(users)} users (Agent {agent_id})")
+            return users
+        elif status == 502 and retry_count < MAX_RETRIES:
+            wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
+            logger.warning(f"⚠️ 502 Bad Gateway fetching users for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+            await asyncio.sleep(wait_time)
+            return await fetch_user_details(session, agent_id, retry_count + 1)
+        else:
+            if LOG_502_DETAILS or status != 502:
+                logger.error(f"Fetch Details Error {status} for Agent {agent_id}: {body[:200]}")
             else:
-                error_text = await resp.text()
-                if LOG_502_DETAILS or resp.status != 502:
-                    logger.error(f"Fetch Details Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
-                else:
-                    logger.error(f"Fetch Details Error {resp.status} for Agent {agent_id} - Server unavailable")
+                logger.error(f"Fetch Details Error {status} for Agent {agent_id} - Server unavailable")
     except asyncio.TimeoutError:
         logger.error(f"⏱️ Timeout fetching user details for Agent {agent_id}")
     except Exception as e:
@@ -702,87 +725,101 @@ async def process_single_user(session, user, session_dir, agent_id):
             "rejection_reasons": ai_result.get("rejection_reasons", [])
         }
         submission_headers = {
-            
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": HEADERS["Accept"],
             "X-sign-Secret": "QONEQT1607_AI",
-            "Content-Type": "application/json"
+            "Accept-Language": HEADERS["Accept-Language"],
+            "Accept-Encoding": HEADERS["Accept-Encoding"],
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "Origin": HEADERS["Origin"],
+            "Referer": HEADERS["Referer"],
+            "Sec-Fetch-Dest": HEADERS["Sec-Fetch-Dest"],
+            "Sec-Fetch-Mode": HEADERS["Sec-Fetch-Mode"],
+            "Sec-Fetch-Site": HEADERS["Sec-Fetch-Site"],
+            "sec-ch-ua": HEADERS["sec-ch-ua"],
+            "sec-ch-ua-mobile": HEADERS["sec-ch-ua-mobile"],
+            "sec-ch-ua-platform": HEADERS["sec-ch-ua-platform"],
         }
         
         push_start_time = time.time()
         push_api_response = None
         push_success = False
-        
+
         try:
-            async with session.post(push_url, json=push_payload, headers=submission_headers, timeout=aiohttp.ClientTimeout(total=25)) as push_resp:
-                push_elapsed = time.time() - push_start_time
-                
-                push_call_log = {
-                    "endpoint": push_url,
-                    "method": "POST",
-                    "request": push_payload,
-                    "status_code": push_resp.status,
-                    "elapsed_time": push_elapsed,
-                    "timestamp": datetime.now().isoformat()
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(
+                None, _backend_post, push_url, push_payload, submission_headers
+            )
+            push_elapsed = time.time() - push_start_time
+            push_status = raw["status"]
+            push_body = raw["body"]
+
+            push_call_log = {
+                "endpoint": push_url,
+                "method": "POST",
+                "request": push_payload,
+                "status_code": push_status,
+                "elapsed_time": push_elapsed,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Try to parse response JSON
+            try:
+                push_result = json.loads(push_body)
+                push_api_response = push_result
+                push_call_log["response"] = push_result
+            except (json.JSONDecodeError, ValueError):
+                push_api_response = {
+                    "status_code": push_status,
+                    "error": push_body,
+                    "message": push_body
                 }
-                
-                # Try to parse response JSON regardless of status
-                try:
-                    push_result = await push_resp.json()
-                    push_api_response = push_result
-                    push_call_log["response"] = push_result
-                except:
-                    # If JSON parsing fails, get text response
-                    error_text = await push_resp.text()
-                    push_api_response = {
-                        "status_code": push_resp.status,
-                        "error": error_text,
-                        "message": error_text
+                push_call_log["response"] = push_api_response
+
+            if push_status == 200:
+                push_result = push_call_log.get("response", {})
+                user_log["api_calls"].append(push_call_log)
+                push_success = True
+
+                user_log["processing_steps"].append({
+                    "step": "4_result_pushed",
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "success",
+                    "message": "Result successfully pushed to main server",
+                    "push_time": push_elapsed,
+                    "server_response": push_result,
+                    "pushed_data": {
+                        "final_decision": push_payload['final_decision'],
+                        "status_code": push_payload['status_code'],
+                        "rejection_reasons": push_payload['rejection_reasons'],
+                        "extracted_data": push_payload['extracted_data']
                     }
-                    push_call_log["response"] = push_api_response
-                
-                if push_resp.status == 200:
-                    push_result = push_call_log.get("response", {})
-                    user_log["api_calls"].append(push_call_log)
-                    push_success = True
-                    
-                    user_log["processing_steps"].append({
-                        "step": "4_result_pushed",
-                        "timestamp": datetime.now().isoformat(),
-                        "status": "success",
-                        "message": "Result successfully pushed to main server",
-                        "push_time": push_elapsed,
-                        "server_response": push_result,
-                        "pushed_data": {
-                            "final_decision": push_payload['final_decision'],
-                            "status_code": push_payload['status_code'],
-                            "rejection_reasons": push_payload['rejection_reasons'],
-                            "extracted_data": push_payload['extracted_data']
-                        }
-                    })
-                    
-                    # Log with detailed information
-                    decision_log = f"{push_payload['final_decision']} (Code: {push_payload['status_code']})"
-                    if push_payload['rejection_reasons']:
-                        decision_log += f" | Reasons: {', '.join(push_payload['rejection_reasons'])}"
-                    logger.info(f"✅ User {user_id}: Processed & Pushed ({decision_log})")
-                    
-                else:
-                    push_result = push_call_log.get("response", {})
-                    user_log["api_calls"].append(push_call_log)
-                    user_log["errors"].append(f"Push failed: Status {push_resp.status}")
-                    
-                    user_log["processing_steps"].append({
-                        "step": "4_result_pushed",
-                        "timestamp": datetime.now().isoformat(),
-                        "status": "failed",
-                        "message": f"Failed to push result to main server",
-                        "status_code": push_resp.status,
-                        "api_response": push_result,
-                        "error": push_result.get("error") if isinstance(push_result, dict) else str(push_result)
-                    })
-                    
-                    api_error_msg = push_result.get("message") if isinstance(push_result, dict) else str(push_result)[:100]
-                    logger.error(f" User {user_id}: Failed to Push Result {push_resp.status} - {api_error_msg}")
-                    
+                })
+
+                decision_log = f"{push_payload['final_decision']} (Code: {push_payload['status_code']})"
+                if push_payload['rejection_reasons']:
+                    decision_log += f" | Reasons: {', '.join(push_payload['rejection_reasons'])}"
+                logger.info(f"✅ User {user_id}: Processed & Pushed ({decision_log})")
+
+            else:
+                push_result = push_call_log.get("response", {})
+                user_log["api_calls"].append(push_call_log)
+                user_log["errors"].append(f"Push failed: Status {push_status}")
+
+                user_log["processing_steps"].append({
+                    "step": "4_result_pushed",
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "failed",
+                    "message": f"Failed to push result to main server",
+                    "status_code": push_status,
+                    "api_response": push_result,
+                    "error": push_result.get("error") if isinstance(push_result, dict) else str(push_result)
+                })
+
+                api_error_msg = push_result.get("message") if isinstance(push_result, dict) else str(push_result)[:100]
+                logger.error(f" User {user_id}: Failed to Push Result {push_status} - {api_error_msg}")
+
         except Exception as push_error:
             push_elapsed = time.time() - push_start_time
             user_log["errors"].append(f"Push exception: {str(push_error)}")
