@@ -280,13 +280,21 @@ If any field is not clearly visible, use empty string "". Do not include any exp
         except Exception as e:
             return {"error": str(e)}
 
+def _digit_diff_count(a: str, b: str) -> int:
+    """Count how many digit positions differ between two equal-length strings."""
+    if len(a) != len(b):
+        return max(len(a), len(b))
+    return sum(1 for x, y in zip(a, b) if x != y)
+
 def cross_check_aadhaar(front_data: dict, back_data: dict) -> tuple[dict, bool, list]:
     """
     Merge front and back Aadhaar data and cross-check Aadhaar numbers and VID numbers.
+    Allows up to 2 digit differences to tolerate OCR misreads.
 
     Returns:
         tuple: (merged_data, cross_check_passed, failure_list)
     """
+    OCR_TOLERANCE = 2  # max digit differences allowed
     failures = []
 
     # Merge: front provides name/dob/gender, back provides address/pincode
@@ -319,8 +327,9 @@ def cross_check_aadhaar(front_data: dict, back_data: dict) -> tuple[dict, bool, 
         back_is_valid = len(back_num) == 12 and back_num.isdigit()
 
         if front_is_valid and back_is_valid:
-            if front_num != back_num:
-                failures.append(f"Aadhaar Number Mismatch (Front: {front_num} vs Back: {back_num})")
+            diff = _digit_diff_count(front_num, back_num)
+            if diff > OCR_TOLERANCE:
+                failures.append(f"Aadhaar Number Mismatch (Front: {front_num} vs Back: {back_num}, {diff} digits differ)")
         # If one side is invalid/empty, we don't fail cross-check — just use what we have
 
     # Cross-check VID numbers
@@ -332,8 +341,9 @@ def cross_check_aadhaar(front_data: dict, back_data: dict) -> tuple[dict, bool, 
         back_vid_valid = len(back_vid) == 16 and back_vid.isdigit()
 
         if front_vid_valid and back_vid_valid:
-            if front_vid != back_vid:
-                failures.append(f"VID Number Mismatch (Front: {front_vid} vs Back: {back_vid})")
+            diff = _digit_diff_count(front_vid, back_vid)
+            if diff > OCR_TOLERANCE:
+                failures.append(f"VID Number Mismatch (Front: {front_vid} vs Back: {back_vid}, {diff} digits differ)")
 
     # Use back VID if front VID is empty
     if not merged["vid_number"] and back_vid:
