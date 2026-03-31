@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Optional, Union, List, Dict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, File, UploadFile, Form
 from pydantic import BaseModel
 import pandas as pd
 from datetime import datetime
@@ -473,6 +473,8 @@ class VerifyRequest(BaseModel):
     selfie_photo: str
     gender: Optional[str] = None
 
+
+
 # --- Helper Functions ---
 def save_progress(data: dict):
     try:
@@ -563,7 +565,7 @@ async def fetch_file(session: aiohttp.ClientSession, source: str) -> Optional[io
         print(f"Error fetching {source}: {e}")
     return None
 
-async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[str] = None, expected_gender: Optional[str] = None) -> dict:
+async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[str] = None, expected_gender: Optional[str] = None, product: str = "qoneqt") -> dict:
     """
     Verify a single user.
     Images dict can contain file paths (str) or in-memory objects (io.BytesIO).
@@ -742,10 +744,11 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
 
             face_verification_result = await loop.run_in_executor(
                 None,
-                verify_faces_memory,
+                lambda s, a, u, p: verify_faces_memory(s, a, u, p),
                 selfie_input,
                 aadhaar_input,
-                str(user_id)
+                str(user_id),
+                product
             )
 
             face_sim = face_verification_result.get("similarity_score", 0.0)
@@ -958,6 +961,49 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
     finally:
         gc.collect()
 
+# --- Mahafraxn Verification Helpers ---
+async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False):
+    """Internal helper for Mahafraxn verification pipeline"""
+    try:
+        # Check if mandatory images exist
+        missing = []
+        if not images.get("selfie"): missing.append("selfie")
+        if not images.get("aadhar_front"): missing.append("aadhar_front")
+        if not images.get("aadhar_back"): missing.append("aadhar_back")
+        if missing:
+            return {
+                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
+                "status_code": 1, "score": 0, "product": "mahafraxn",
+                "reason": f"Image processing failed: {', '.join(missing)}",
+                "rejection_reasons": [f"missing_{m}" for m in missing]
+            }
+
+        result = await verify_single_user(user_id, images, dob, gender, product="mahafraxn")
+
+        # Encrypted audit log with mahafraxn prefix
+        if encrypted_logger:
+            try:
+                encrypted_logger.log_user(f"mahafraxn_{user_id}", result)
+            except Exception as log_err:
+                print(f"[mahafraxn][{user_id}] Encrypted logging failed: {log_err}")
+
+        # Add product tag to response
+        result["product"] = "mahafraxn"
+
+        if not debug:
+            filtered = _filter_response(result)
+            filtered["product"] = "mahafraxn"
+            return filtered
+
+        return result
+
+    except Exception as e:
+        print(f"[mahafraxn] Error in verification: {e}")
+        traceback.print_exc()
+        return {"status": "error", "message": str(e), "user_id": user_id, "product": "mahafraxn"}
+    finally:
+        gc.collect()
+
 def _filter_response(full_record: dict) -> dict:
     """Filter the response to only include essential fields for the API (Production)"""
     return {
@@ -969,6 +1015,108 @@ def _filter_response(full_record: dict) -> dict:
         "rejection_reasons": full_record.get("rejection_reasons", []),
         "extracted_data": full_record.get("extracted_data", {})
     }
+
+# --- Mahafraxn Endpoint ---
+@app.post("/mahafraxn/verify")
+async def mahafraxn_verify(
+    user_id: str = Form(...),
+    documents_aadhaar_front: UploadFile = File(None),
+    documents_aadhaar_back: UploadFile = File(None),
+    documents_selfie: UploadFile = File(None),
+    aadhar_front_url: Optional[str] = Form(None),
+    aadhar_back_url: Optional[str] = Form(None),
+    selfie_url: Optional[str] = Form(None),
+    dob: Optional[str] = Form(None),
+    gender: Optional[str] = Form(None),
+):
+    """
+    Unified Mahafraxn verification endpoint.
+    Accepts raw file uploads (multipart/form-data) OR presigned URLs.
+    Priority: raw file upload first, falls back to URL if file not provided or empty.
+    """
+    try:
+        print(f"[mahafraxn][{user_id}] Resolving images (upload > URL fallback)...")
+
+        async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
+            # Try raw file upload first
+            if upload and upload.size and upload.size > 0:
+                raw = await upload.read()
+                if raw:
+                    print(f"[mahafraxn][{user_id}] {label}: loaded from upload ({len(raw)} bytes)")
+                    return io.BytesIO(raw)
+            # Fallback to presigned URL / CDN link
+            if url:
+                print(f"[mahafraxn][{user_id}] {label}: fetching from URL...")
+                img = await fetch_file(http_session, url)
+                if img:
+                    return img
+                print(f"[mahafraxn][{user_id}] {label}: URL fetch failed")
+            return None
+
+        front_img, back_img, selfie_img = await asyncio.gather(
+            resolve_image(documents_aadhaar_front, aadhar_front_url, "aadhar_front"),
+            resolve_image(documents_aadhaar_back, aadhar_back_url, "aadhar_back"),
+            resolve_image(documents_selfie, selfie_url, "selfie"),
+        )
+
+        images = {
+            "aadhar_front": front_img,
+            "aadhar_back": back_img,
+            "selfie": selfie_img,
+        }
+
+        return await _run_mahafraxn_verification(images, user_id, dob, gender)
+
+    except Exception as e:
+        print(f"[mahafraxn] Endpoint error: {e}")
+        traceback.print_exc()
+        return {"status": "error", "message": str(e), "user_id": user_id, "product": "mahafraxn"}
+
+@app.post("/mahafraxn/verify/debug")
+async def mahafraxn_verify_debug(
+    user_id: str = Form(...),
+    documents_aadhaar_front: UploadFile = File(None),
+    documents_aadhaar_back: UploadFile = File(None),
+    documents_selfie: UploadFile = File(None),
+    aadhar_front_url: Optional[str] = Form(None),
+    aadhar_back_url: Optional[str] = Form(None),
+    selfie_url: Optional[str] = Form(None),
+    dob: Optional[str] = Form(None),
+    gender: Optional[str] = Form(None),
+):
+    """Mahafraxn verification - Returns FULL VERBOSE JSON (Debug). Same input as /mahafraxn/verify."""
+    try:
+        print(f"[mahafraxn][{user_id}] Resolving images (debug, upload > URL fallback)...")
+
+        async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
+            if upload and upload.size and upload.size > 0:
+                raw = await upload.read()
+                if raw:
+                    return io.BytesIO(raw)
+            if url:
+                img = await fetch_file(http_session, url)
+                if img:
+                    return img
+            return None
+
+        front_img, back_img, selfie_img = await asyncio.gather(
+            resolve_image(documents_aadhaar_front, aadhar_front_url, "aadhar_front"),
+            resolve_image(documents_aadhaar_back, aadhar_back_url, "aadhar_back"),
+            resolve_image(documents_selfie, selfie_url, "selfie"),
+        )
+
+        images = {
+            "aadhar_front": front_img,
+            "aadhar_back": back_img,
+            "selfie": selfie_img,
+        }
+
+        return await _run_mahafraxn_verification(images, user_id, dob, gender, debug=True)
+
+    except Exception as e:
+        print(f"[mahafraxn] Debug endpoint error: {e}")
+        traceback.print_exc()
+        return {"status": "error", "message": str(e), "user_id": user_id, "product": "mahafraxn"}
 
 @app.get("/batch/progress")
 async def get_batch_progress():
@@ -991,6 +1139,7 @@ async def get_batch_results():
 async def health_check():
     return {
         "status": "healthy",
+        "products": ["qoneqt", "mahafraxn"],
         "components": {
             "qwen_agent": qwen_agent is not None,
             "face_verifier": face_verifier_ready,

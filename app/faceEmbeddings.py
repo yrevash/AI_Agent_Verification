@@ -40,6 +40,19 @@ OUTPUT_DIR = os.path.join(REPO_DIR, "extracted_data")
 SELFIE_EMBEDDINGS_FILE = os.path.join(OUTPUT_DIR, "selfie_embeddings.pkl")
 AADHAAR_EMBEDDINGS_FILE = os.path.join(OUTPUT_DIR, "aadhaar_embeddings.pkl")
 
+
+def _get_product_paths(product: str = "qoneqt") -> tuple[str, str, str]:
+    """Get product-specific output dir and embedding file paths."""
+    if product == "qoneqt":
+        return OUTPUT_DIR, SELFIE_EMBEDDINGS_FILE, AADHAAR_EMBEDDINGS_FILE
+    product_dir = os.path.join(REPO_DIR, "extracted_data", product)
+    os.makedirs(product_dir, exist_ok=True)
+    return (
+        product_dir,
+        os.path.join(product_dir, "selfie_embeddings.pkl"),
+        os.path.join(product_dir, "aadhaar_embeddings.pkl"),
+    )
+
 # Lazy-initialized face detector
 _face_detector = None
 
@@ -81,26 +94,30 @@ def _load_db(filepath: str) -> dict:
 
 def _save_db(db: dict, filepath: str) -> None:
     """Save embeddings database to a pkl file."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "wb") as f:
         pickle.dump(db, f)
 
 
-def load_selfie_db() -> dict:
-    return _load_db(SELFIE_EMBEDDINGS_FILE)
+def load_selfie_db(product: str = "qoneqt") -> dict:
+    _, selfie_file, _ = _get_product_paths(product)
+    return _load_db(selfie_file)
 
-def load_aadhaar_db() -> dict:
-    return _load_db(AADHAAR_EMBEDDINGS_FILE)
+def load_aadhaar_db(product: str = "qoneqt") -> dict:
+    _, _, aadhaar_file = _get_product_paths(product)
+    return _load_db(aadhaar_file)
 
-def save_selfie_embedding(user_id: str, embedding: np.ndarray) -> None:
-    db = load_selfie_db()
+def save_selfie_embedding(user_id: str, embedding: np.ndarray, product: str = "qoneqt") -> None:
+    db = load_selfie_db(product)
     db[user_id] = embedding
-    _save_db(db, SELFIE_EMBEDDINGS_FILE)
+    _, selfie_file, _ = _get_product_paths(product)
+    _save_db(db, selfie_file)
 
-def save_aadhaar_embedding(user_id: str, embedding: np.ndarray) -> None:
-    db = load_aadhaar_db()
+def save_aadhaar_embedding(user_id: str, embedding: np.ndarray, product: str = "qoneqt") -> None:
+    db = load_aadhaar_db(product)
     db[user_id] = embedding
-    _save_db(db, AADHAAR_EMBEDDINGS_FILE)
+    _, _, aadhaar_file = _get_product_paths(product)
+    _save_db(db, aadhaar_file)
 
 
 def _check_duplicate_in_db(embedding: np.ndarray, db: dict) -> tuple[bool, str | None, float]:
@@ -126,15 +143,15 @@ def _check_duplicate_in_db(embedding: np.ndarray, db: dict) -> tuple[bool, str |
     return is_duplicate, matching_user_id if is_duplicate else None, float(max_similarity)
 
 
-def check_all_duplicates(selfie_embedding: np.ndarray, aadhaar_embedding: np.ndarray) -> dict:
+def check_all_duplicates(selfie_embedding: np.ndarray, aadhaar_embedding: np.ndarray, product: str = "qoneqt") -> dict:
     """
     Check both selfie and Aadhaar embeddings against their respective databases.
 
     Returns:
         dict with duplicate info for both selfie and Aadhaar face
     """
-    selfie_db = load_selfie_db()
-    aadhaar_db = load_aadhaar_db()
+    selfie_db = load_selfie_db(product)
+    aadhaar_db = load_aadhaar_db(product)
 
     selfie_dup, selfie_dup_user, selfie_dup_sim = _check_duplicate_in_db(selfie_embedding, selfie_db)
     aadhaar_dup, aadhaar_dup_user, aadhaar_dup_sim = _check_duplicate_in_db(aadhaar_embedding, aadhaar_db)
@@ -227,7 +244,7 @@ def cosine_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> float:
     return dot_product / (norm1 * norm2)
 
 
-def verify_faces_memory(selfie_img: io.BytesIO, aadhaar_img: io.BytesIO, user_id: str = None) -> dict:
+def verify_faces_memory(selfie_img: io.BytesIO, aadhaar_img: io.BytesIO, user_id: str = None, product: str = "qoneqt") -> dict:
     """
     Verify if the face in selfie matches the face in Aadhaar card.
     In-memory version: accepts BytesIO objects, skips saving cropped images to disk.
@@ -237,6 +254,7 @@ def verify_faces_memory(selfie_img: io.BytesIO, aadhaar_img: io.BytesIO, user_id
         selfie_img: BytesIO selfie image
         aadhaar_img: BytesIO Aadhaar card image
         user_id: Optional user ID (auto-generated if not provided)
+        product: Product name for separate embedding storage (default: "qoneqt")
 
     Returns:
         dict with verification result including similarity_score, verified, duplicate info
@@ -281,7 +299,7 @@ def verify_faces_memory(selfie_img: io.BytesIO, aadhaar_img: io.BytesIO, user_id
 
     # Check for duplicates FIRST — before similarity check
     # Checks selfie against selfie DB AND Aadhaar face against Aadhaar face DB
-    dup_result = check_all_duplicates(selfie_embedding, aadhaar_embedding)
+    dup_result = check_all_duplicates(selfie_embedding, aadhaar_embedding, product)
     result["is_duplicate"] = dup_result["is_duplicate"]
     result["selfie_duplicate"] = dup_result["selfie_duplicate"]
     result["selfie_duplicate_user_id"] = dup_result["selfie_duplicate_user_id"]
@@ -311,8 +329,8 @@ def verify_faces_memory(selfie_img: io.BytesIO, aadhaar_img: io.BytesIO, user_id
         if user_id is None:
             user_id = str(uuid.uuid4())[:8]
 
-        save_selfie_embedding(user_id, selfie_embedding)
-        save_aadhaar_embedding(user_id, aadhaar_embedding)
+        save_selfie_embedding(user_id, selfie_embedding, product)
+        save_aadhaar_embedding(user_id, aadhaar_embedding, product)
         result["user_id"] = user_id
         result["embedding_saved"] = True
 
@@ -424,10 +442,10 @@ def verify_faces(selfie_path: str, aadhaar_path: str, user_id: str = None) -> di
     return result
 
 
-def list_registered_users() -> dict:
+def list_registered_users(product: str = "qoneqt") -> dict:
     """List all registered user IDs from both selfie and Aadhaar databases."""
-    selfie_db = load_selfie_db()
-    aadhaar_db = load_aadhaar_db()
+    selfie_db = load_selfie_db(product)
+    aadhaar_db = load_aadhaar_db(product)
     return {
         "selfie_users": list(selfie_db.keys()),
         "aadhaar_users": list(aadhaar_db.keys()),
