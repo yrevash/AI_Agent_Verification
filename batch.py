@@ -965,11 +965,60 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
 async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False):
     """Internal helper for Mahafraxn verification pipeline"""
     try:
-        # Check if mandatory images exist
+        has_selfie = images.get("selfie") is not None
+        has_front = images.get("aadhar_front") is not None
+        has_back = images.get("aadhar_back") is not None
+
+        # Selfie-only mode: just run duplicate check against mahafraxn DB
+        if has_selfie and not has_front and not has_back:
+            print(f"[mahafraxn][{user_id}] Selfie-only mode — running duplicate check...")
+            from app.faceEmbeddings import check_selfie_duplicate
+
+            loop = asyncio.get_event_loop()
+            selfie_input = images["selfie"]
+            if isinstance(selfie_input, io.BytesIO):
+                selfie_input.seek(0)
+
+            dup_result = await loop.run_in_executor(
+                None,
+                lambda: check_selfie_duplicate(selfie_input, str(user_id), product="mahafraxn")
+            )
+
+            result = {
+                "user_id": user_id,
+                "mode": "selfie_only_duplicate_check",
+                "selfie_face_detected": dup_result["selfie_face_detected"],
+                "is_duplicate": dup_result["is_duplicate"],
+                "duplicate_user_id": dup_result.get("duplicate_user_id"),
+                "duplicate_similarity": dup_result.get("duplicate_similarity", 0.0),
+                "status": "REJECTED" if dup_result["is_duplicate"] else ("FAILED" if dup_result.get("error") and not dup_result["selfie_face_detected"] else "OK"),
+                "final_decision": "REJECTED" if dup_result["is_duplicate"] else ("FAILED" if dup_result.get("error") and not dup_result["selfie_face_detected"] else "NOT_DUPLICATE"),
+                "status_code": 1 if dup_result["is_duplicate"] else 0,
+                "rejection_reasons": [f"duplicate_face_matches_{dup_result['duplicate_user_id']}"] if dup_result["is_duplicate"] else [],
+                "error": dup_result.get("error"),
+                "product": "mahafraxn",
+            }
+
+            if encrypted_logger:
+                try:
+                    encrypted_logger.log_user(f"mahafraxn_{user_id}", result)
+                except Exception:
+                    pass
+
+            return result
+
+        # Full verification mode: selfie + front + back required
+        if not has_selfie:
+            return {
+                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
+                "status_code": 1, "score": 0, "product": "mahafraxn",
+                "reason": "Selfie is required",
+                "rejection_reasons": ["missing_selfie"]
+            }
+
         missing = []
-        if not images.get("selfie"): missing.append("selfie")
-        if not images.get("aadhar_front"): missing.append("aadhar_front")
-        if not images.get("aadhar_back"): missing.append("aadhar_back")
+        if not has_front: missing.append("aadhar_front")
+        if not has_back: missing.append("aadhar_back")
         if missing:
             return {
                 "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",

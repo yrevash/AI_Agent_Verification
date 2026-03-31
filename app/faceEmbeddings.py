@@ -143,6 +143,53 @@ def _check_duplicate_in_db(embedding: np.ndarray, db: dict) -> tuple[bool, str |
     return is_duplicate, matching_user_id if is_duplicate else None, float(max_similarity)
 
 
+def check_selfie_duplicate(selfie_img: io.BytesIO, user_id: str = None, product: str = "qoneqt") -> dict:
+    """
+    Selfie-only duplicate check. Detects face, extracts embedding,
+    checks against stored selfie DB for the given product.
+    Does NOT save the embedding — only checks.
+
+    Returns:
+        dict with duplicate info and face detection status
+    """
+    result = {
+        "selfie_face_detected": False,
+        "is_duplicate": False,
+        "duplicate_user_id": None,
+        "duplicate_similarity": 0.0,
+        "error": None,
+        "product": product,
+    }
+
+    # Detect face
+    selfie_detected, _, selfie_face = detect_face(selfie_img)
+    result["selfie_face_detected"] = selfie_detected
+
+    if not selfie_detected:
+        result["error"] = "No face detected in selfie image"
+        return result
+
+    # Extract embedding
+    try:
+        selfie_embedding = get_face_embedding(selfie_face)
+    except Exception as e:
+        result["error"] = f"Failed to extract face embedding: {str(e)}"
+        return result
+
+    # Check against selfie DB
+    selfie_db = load_selfie_db(product)
+    is_dup, dup_user, dup_sim = _check_duplicate_in_db(selfie_embedding, selfie_db)
+
+    result["is_duplicate"] = is_dup
+    result["duplicate_user_id"] = dup_user
+    result["duplicate_similarity"] = round(dup_sim, 4)
+
+    if is_dup:
+        result["error"] = f"Duplicate detected: selfie matches user {dup_user} (similarity: {dup_sim:.4f})"
+
+    return result
+
+
 def check_all_duplicates(selfie_embedding: np.ndarray, aadhaar_embedding: np.ndarray, product: str = "qoneqt") -> dict:
     """
     Check both selfie and Aadhaar embeddings against their respective databases.
