@@ -34,10 +34,10 @@ from scoring import VerificationScorer
 class OllamaQwenAgent:
     """Ollama-based Qwen agent for document extraction using qwen3-vl:8b-instruct"""
 
-    def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", model: str = "qwen3-vl:8b-instruct"):
+    def __init__(self, ollama_url: str = "http://localhost:8000/v1/chat/completions", model: str = "Qwen/Qwen3-VL-8B-Instruct"):
         self.ollama_url = ollama_url
         self.model = model
-        print(f"Initialized Ollama Qwen Agent with model: {model}")
+        print(f"Initialized Qwen Agent (vLLM) with model: {model}")
 
     def _image_to_base64(self, image_input: Union[str, io.BytesIO]) -> str:
         """
@@ -79,21 +79,25 @@ class OllamaQwenAgent:
             return ""
 
     def _call_ollama(self, prompt: str, images: list) -> str:
-        """Call Ollama API with vision model"""
+        """Call vLLM OpenAI-compatible API with vision model"""
+        content = []
+        for img_b64 in images:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+            })
+        content.append({"type": "text", "text": prompt})
+
         payload = {
             "model": self.model,
-            "prompt": prompt,
-            "images": images,
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "num_predict": 512
-            }
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 512,
+            "temperature": 0.1
         }
 
         response = requests.post(self.ollama_url, json=payload, timeout=120)
         response.raise_for_status()
-        return response.json().get("response", "")
+        return response.json()["choices"][0]["message"]["content"]
 
     def validate_aadhaar_front(self, image_input: Union[str, io.BytesIO]) -> dict:
         """Check if the image is an Aadhaar card front side."""
@@ -399,12 +403,12 @@ async def lifespan(app: FastAPI):
 
     # Initialize Qwen Agent (primary extraction method - OLLAMA)
     try:
-        print("Initializing Ollama Qwen Agent for document extraction...")
+        print("Initializing Qwen Agent (vLLM) for document extraction...")
         qwen_agent = OllamaQwenAgent(
-            ollama_url="http://localhost:11434/api/generate",
-            model="qwen3-vl:8b-instruct"
+            ollama_url="http://localhost:8000/v1/chat/completions",
+            model="Qwen/Qwen3-VL-8B-Instruct"
         )
-        print("Ollama Qwen Agent initialized (qwen3-vl:8b-instruct)")
+        print("Qwen Agent initialized via vLLM (Qwen/Qwen3-VL-8B-Instruct)")
     except Exception as e:
         print(f"Ollama Qwen Agent initialization failed: {e}")
         import traceback
