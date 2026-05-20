@@ -464,6 +464,48 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# --- Mahafraxn JSON Logger ---
+class MahafraxnLogger:
+    """Writes per-user JSON logs to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json"""
+
+    BASE_DIR = Path("logs/mahafraxn-logs")
+
+    def log(self, agent_name: str, user_id: str, record: dict) -> Path:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        out_dir = self.BASE_DIR / agent_name / date_str
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = str(user_id).replace("/", "_").replace("\\", "_")
+        out_path = out_dir / f"{safe_id}.json"
+        out_path.write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
+        return out_path
+
+    def read(self, agent_name: str, date: str, user_id: str) -> dict:
+        safe_id = str(user_id).replace("/", "_").replace("\\", "_")
+        path = self.BASE_DIR / agent_name / date / f"{safe_id}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"No log: {path}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def list_agents(self) -> list[str]:
+        if not self.BASE_DIR.exists():
+            return []
+        return sorted(p.name for p in self.BASE_DIR.iterdir() if p.is_dir())
+
+    def list_dates(self, agent_name: str) -> list[str]:
+        agent_dir = self.BASE_DIR / agent_name
+        if not agent_dir.exists():
+            return []
+        return sorted(p.name for p in agent_dir.iterdir() if p.is_dir())
+
+    def list_users(self, agent_name: str, date: str) -> list[str]:
+        date_dir = self.BASE_DIR / agent_name / date
+        if not date_dir.exists():
+            return []
+        return sorted(p.stem for p in date_dir.glob("*.json"))
+
+
+mahafraxn_logger = MahafraxnLogger()
+
 # --- Request Models ---
 class BatchVerifyRequest(BaseModel):
     dataset_root: str
@@ -966,7 +1008,7 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
         gc.collect()
 
 # --- Mahafraxn Verification Helpers ---
-async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False):
+async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False, agent_name: str = "default"):
     """Internal helper for Mahafraxn verification pipeline"""
     try:
         has_selfie = images.get("selfie") is not None
@@ -1003,6 +1045,11 @@ async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[
                 "product": "mahafraxn",
             }
 
+            try:
+                mahafraxn_logger.log(agent_name, user_id, result)
+            except Exception as log_err:
+                print(f"[mahafraxn][{user_id}] JSON logging failed: {log_err}")
+
             if encrypted_logger:
                 try:
                     encrypted_logger.log_user(f"mahafraxn_{user_id}", result)
@@ -1032,6 +1079,12 @@ async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[
             }
 
         result = await verify_single_user(user_id, images, dob, gender, product="mahafraxn")
+
+        # JSON log to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json
+        try:
+            mahafraxn_logger.log(agent_name, user_id, result)
+        except Exception as log_err:
+            print(f"[mahafraxn][{user_id}] JSON logging failed: {log_err}")
 
         # Encrypted audit log with mahafraxn prefix
         if encrypted_logger:
@@ -1073,6 +1126,7 @@ def _filter_response(full_record: dict) -> dict:
 @app.post("/mahafraxn/verify")
 async def mahafraxn_verify(
     user_id: str = Form(...),
+    agent_name: str = Form("default"),
     documents_aadhaar_front: UploadFile = File(None),
     documents_aadhaar_back: UploadFile = File(None),
     documents_selfie: UploadFile = File(None),
@@ -1086,24 +1140,25 @@ async def mahafraxn_verify(
     Unified Mahafraxn verification endpoint.
     Accepts raw file uploads (multipart/form-data) OR presigned URLs.
     Priority: raw file upload first, falls back to URL if file not provided or empty.
+    Logs are written to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json
     """
     try:
-        print(f"[mahafraxn][{user_id}] Resolving images (upload > URL fallback)...")
+        print(f"[mahafraxn][{agent_name}][{user_id}] Resolving images (upload > URL fallback)...")
 
         async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
             # Try raw file upload first
             if upload and upload.size and upload.size > 0:
                 raw = await upload.read()
                 if raw:
-                    print(f"[mahafraxn][{user_id}] {label}: loaded from upload ({len(raw)} bytes)")
+                    print(f"[mahafraxn][{agent_name}][{user_id}] {label}: loaded from upload ({len(raw)} bytes)")
                     return io.BytesIO(raw)
             # Fallback to presigned URL / CDN link
             if url:
-                print(f"[mahafraxn][{user_id}] {label}: fetching from URL...")
+                print(f"[mahafraxn][{agent_name}][{user_id}] {label}: fetching from URL...")
                 img = await fetch_file(http_session, url)
                 if img:
                     return img
-                print(f"[mahafraxn][{user_id}] {label}: URL fetch failed")
+                print(f"[mahafraxn][{agent_name}][{user_id}] {label}: URL fetch failed")
             return None
 
         front_img, back_img, selfie_img = await asyncio.gather(
@@ -1118,7 +1173,7 @@ async def mahafraxn_verify(
             "selfie": selfie_img,
         }
 
-        return await _run_mahafraxn_verification(images, user_id, dob, gender)
+        return await _run_mahafraxn_verification(images, user_id, dob, gender, agent_name=agent_name)
 
     except Exception as e:
         print(f"[mahafraxn] Endpoint error: {e}")
@@ -1128,6 +1183,7 @@ async def mahafraxn_verify(
 @app.post("/mahafraxn/verify/debug")
 async def mahafraxn_verify_debug(
     user_id: str = Form(...),
+    agent_name: str = Form("default"),
     documents_aadhaar_front: UploadFile = File(None),
     documents_aadhaar_back: UploadFile = File(None),
     documents_selfie: UploadFile = File(None),
@@ -1139,7 +1195,7 @@ async def mahafraxn_verify_debug(
 ):
     """Mahafraxn verification - Returns FULL VERBOSE JSON (Debug). Same input as /mahafraxn/verify."""
     try:
-        print(f"[mahafraxn][{user_id}] Resolving images (debug, upload > URL fallback)...")
+        print(f"[mahafraxn][{agent_name}][{user_id}] Resolving images (debug, upload > URL fallback)...")
 
         async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
             if upload and upload.size and upload.size > 0:
@@ -1164,7 +1220,7 @@ async def mahafraxn_verify_debug(
             "selfie": selfie_img,
         }
 
-        return await _run_mahafraxn_verification(images, user_id, dob, gender, debug=True)
+        return await _run_mahafraxn_verification(images, user_id, dob, gender, debug=True, agent_name=agent_name)
 
     except Exception as e:
         print(f"[mahafraxn] Debug endpoint error: {e}")
@@ -1222,6 +1278,36 @@ async def audit_list_users():
         return {"status": "error", "message": "Encrypted logger not initialized"}
     users = encrypted_logger.list_logged_users()
     return {"status": "ok", "count": len(users), "user_ids": users}
+
+# --- Mahafraxn Audit Endpoints ---
+@app.get("/audit/mahafraxn")
+async def mahafraxn_audit_agents():
+    """List all agent names that have Mahafraxn logs."""
+    agents = mahafraxn_logger.list_agents()
+    return {"status": "ok", "count": len(agents), "agents": agents}
+
+@app.get("/audit/mahafraxn/{agent_name}")
+async def mahafraxn_audit_dates(agent_name: str):
+    """List all dates that have Mahafraxn logs for a given agent."""
+    dates = mahafraxn_logger.list_dates(agent_name)
+    return {"status": "ok", "agent_name": agent_name, "count": len(dates), "dates": dates}
+
+@app.get("/audit/mahafraxn/{agent_name}/{date}")
+async def mahafraxn_audit_users(agent_name: str, date: str):
+    """List all user IDs logged under a specific agent and date."""
+    users = mahafraxn_logger.list_users(agent_name, date)
+    return {"status": "ok", "agent_name": agent_name, "date": date, "count": len(users), "user_ids": users}
+
+@app.get("/audit/mahafraxn/{agent_name}/{date}/{user_id}")
+async def mahafraxn_audit_user(agent_name: str, date: str, user_id: str):
+    """Return the JSON verification log for a specific Mahafraxn user."""
+    try:
+        record = mahafraxn_logger.read(agent_name, date, user_id)
+        return {"status": "ok", "agent_name": agent_name, "date": date, "user_id": user_id, "record": record}
+    except FileNotFoundError:
+        return {"status": "not_found", "message": f"No log for {agent_name}/{date}/{user_id}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # --- Background Processing ---
 async def process_batch(dataset_root: str, output_dir: str):
