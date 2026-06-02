@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Optional, Union, List, Dict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import pandas as pd
 from datetime import datetime
@@ -284,6 +284,103 @@ If any field is not clearly visible, use empty string "". Do not include any exp
         except Exception as e:
             return {"error": str(e)}
 
+    def validate_passport(self, image_input: Union[str, io.BytesIO]) -> dict:
+        """Check if the image is a passport (data/photo page)."""
+        try:
+            img_b64 = self._image_to_base64(image_input)
+            if not img_b64:
+                return {"is_passport": False, "reason": "Image processing failed"}
+
+            prompt = """Look at this image carefully. Is this a PASSPORT (the photo/data page of a passport booklet)?
+
+A passport data page typically contains:
+- A photo of the person
+- Passport / document number
+- Surname and given names
+- Date of birth
+- Nationality / country
+- Sex
+- Date of issue and date of expiry
+- The machine-readable zone (two lines of '<' characters) at the bottom
+
+Return ONLY in this exact JSON format:
+{
+  "is_passport": true,
+  "reason": "short reason"
+}
+
+Do not include any explanation, only return the JSON."""
+
+            response_text = self._call_ollama(prompt, [img_b64])
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"is_passport": False, "reason": "Failed to parse validation response"}
+        except Exception as e:
+            return {"is_passport": False, "reason": str(e)}
+
+    def extract_passport(self, front_image: Union[str, io.BytesIO],
+                         back_image: Optional[Union[str, io.BytesIO]] = None) -> dict:
+        """
+        Extract passport data from one or two passport images.
+        Returns: passport_number, name, dob, gender, nationality, country,
+        date_of_expiry, place_of_birth.
+        """
+        try:
+            front_b64 = self._image_to_base64(front_image)
+            if not front_b64:
+                return {"error": "Passport front image processing failed"}
+
+            images = [front_b64]
+            if back_image is not None:
+                back_b64 = self._image_to_base64(back_image)
+                if back_b64:
+                    images.append(back_b64)
+
+            prompt = """Analyze these passport image(s) and extract the following information:
+
+1. Passport Number (the document number, usually top-right of the data page)
+2. Full Name (surname + given names as printed)
+3. Date of Birth (DOB)
+4. Gender/Sex (Male or Female)
+5. Nationality
+6. Country (issuing country)
+7. Date of Expiry
+8. Place of Birth
+
+Return ONLY in this exact JSON format:
+{
+  "passport_number": "A1234567",
+  "name": "Full Name",
+  "dob": "DD/MM/YYYY",
+  "gender": "Male or Female",
+  "nationality": "Nationality",
+  "country": "Issuing Country",
+  "date_of_expiry": "DD/MM/YYYY",
+  "place_of_birth": "City, Country"
+}
+
+If any field is not clearly visible, use empty string "". Do not include any explanation, only return the JSON."""
+
+            response_text = self._call_ollama(prompt, images)
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"error": "Failed to parse passport response"}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+def _is_india(country: Optional[str]) -> bool:
+    """Return True if the user's country indicates India (default when unset)."""
+    if country is None:
+        return True
+    c = str(country).strip().lower()
+    if not c:
+        return True
+    return c in {"india", "in", "ind", "bharat", "356"}
+
+
 def _digit_diff_count(a: str, b: str) -> int:
     """Count how many digit positions differ between two equal-length strings."""
     if len(a) != len(b):
@@ -466,39 +563,33 @@ app = FastAPI(lifespan=lifespan)
 
 # --- Mahafraxn JSON Logger ---
 class MahafraxnLogger:
-    """Writes per-user JSON logs to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json"""
+    """Writes per-user JSON logs to logs/mahafraxn-logs/{date}/{user_id}.json"""
 
     BASE_DIR = Path("logs/mahafraxn-logs")
 
-    def log(self, agent_name: str, user_id: str, record: dict) -> Path:
+    def log(self, user_id: str, record: dict) -> Path:
         date_str = datetime.now().strftime("%Y-%m-%d")
-        out_dir = self.BASE_DIR / agent_name / date_str
+        out_dir = self.BASE_DIR / date_str
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_id = str(user_id).replace("/", "_").replace("\\", "_")
         out_path = out_dir / f"{safe_id}.json"
         out_path.write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
         return out_path
 
-    def read(self, agent_name: str, date: str, user_id: str) -> dict:
+    def read(self, date: str, user_id: str) -> dict:
         safe_id = str(user_id).replace("/", "_").replace("\\", "_")
-        path = self.BASE_DIR / agent_name / date / f"{safe_id}.json"
+        path = self.BASE_DIR / date / f"{safe_id}.json"
         if not path.exists():
             raise FileNotFoundError(f"No log: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def list_agents(self) -> list[str]:
+    def list_dates(self) -> list[str]:
         if not self.BASE_DIR.exists():
             return []
         return sorted(p.name for p in self.BASE_DIR.iterdir() if p.is_dir())
 
-    def list_dates(self, agent_name: str) -> list[str]:
-        agent_dir = self.BASE_DIR / agent_name
-        if not agent_dir.exists():
-            return []
-        return sorted(p.name for p in agent_dir.iterdir() if p.is_dir())
-
-    def list_users(self, agent_name: str, date: str) -> list[str]:
-        date_dir = self.BASE_DIR / agent_name / date
+    def list_users(self, date: str) -> list[str]:
+        date_dir = self.BASE_DIR / date
         if not date_dir.exists():
             return []
         return sorted(p.stem for p in date_dir.glob("*.json"))
@@ -517,6 +608,16 @@ class VerifyRequest(BaseModel):
     passport_first: str
     passport_old: str
     selfie_photo: str
+    gender: Optional[str] = None
+    country: Optional[str] = None
+    name: Optional[str] = None
+
+class MahafraxnVerifyRequest(BaseModel):
+    user_id: Union[int, str]
+    aadhar_front_url: str
+    aadhar_back_url: str
+    selfie_url: str
+    dob: Optional[str] = None
     gender: Optional[str] = None
 
 
@@ -611,11 +712,19 @@ async def fetch_file(session: aiohttp.ClientSession, source: str) -> Optional[io
         print(f"Error fetching {source}: {e}")
     return None
 
-async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[str] = None, expected_gender: Optional[str] = None, product: str = "qoneqt") -> dict:
+async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[str] = None, expected_gender: Optional[str] = None, product: str = "qoneqt", country: Optional[str] = None, expected_name: Optional[str] = None) -> dict:
     """
     Verify a single user.
     Images dict can contain file paths (str) or in-memory objects (io.BytesIO).
+    Routes by country: India -> Aadhaar pipeline, everything else -> passport pipeline.
     """
+    if not _is_india(country):
+        print(f"[{user_id}] Country '{country}' -> PASSPORT verification pipeline")
+        return await verify_passport_user(
+            user_id, images, expected_dob=expected_dob,
+            expected_name=expected_name, product=product, country=country
+        )
+
     user_record = {
         "user_id": user_id,
         "status": "PROCESSING",
@@ -920,6 +1029,233 @@ async def verify_single_user(user_id: str, images: dict, expected_dob: Optional[
 
     return user_record
 
+async def verify_passport_user(user_id: str, images: dict, expected_dob: Optional[str] = None,
+                               expected_name: Optional[str] = None, product: str = "qoneqt",
+                               country: Optional[str] = None) -> dict:
+    """
+    Passport verification pipeline (non-India users).
+
+    Steps:
+      1. Validate + extract passport data via Qwen (passport_number, name, dob, gender, ...)
+      2. Face embedding verification (selfie vs passport photo)
+      3. Score (DOB/name mismatch -> REJECT; face mismatch -> REVIEW, never reject)
+      4. Build response
+    Images: passport pages live in images["aadhar_front"] (primary, with photo) and
+    images["aadhar_back"] (secondary); the live selfie in images["selfie"].
+    """
+    user_record = {
+        "user_id": user_id,
+        "status": "PROCESSING",
+        "final_decision": "PENDING",
+        "status_code": 0,
+        "score": 0,
+        "doc_type": "passport",
+        "country": country,
+        "passport_found": False,
+        "passport_number": "", "passport_name": "", "passport_dob": "", "passport_gender": "",
+        "passport_nationality": "", "passport_country": "", "passport_expiry": "",
+        "extracted_data": {},
+        "input_data": {"dob": expected_dob, "name": expected_name, "country": country},
+        "rejection_reasons": [], "error_log": ""
+    }
+
+    if not qwen_agent:
+        user_record.update({"status": "ERROR", "final_decision": "SYSTEM_ERROR", "status_code": -1, "reason": "Qwen agent not initialized"})
+        return user_record
+
+    loop = asyncio.get_event_loop()
+
+    # Passport page 1 is required; page 2 is optional/supplementary
+    passport_front = images.get("aadhar_front")
+    passport_back = images.get("aadhar_back")
+    if not passport_front:
+        user_record.update({
+            "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+            "rejection_reasons": ["missing_passport_image"],
+            "error_log": "Missing required passport image (passport_first)"
+        })
+        print(f"[{user_id}] REJECTED: Missing passport image")
+        return user_record
+
+    # ========================================================================
+    # Step 1: Validate + extract passport
+    # ========================================================================
+    try:
+        print(f"[{user_id}] Validating passport image...")
+        validation = await loop.run_in_executor(None, qwen_agent.validate_passport, passport_front)
+        if not validation.get("is_passport"):
+            reason = validation.get("reason", "Not a passport")
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["not_passport"],
+                "error_log": f"Image is not a passport: {reason}"
+            })
+            print(f"[{user_id}] REJECTED: Image is not a passport — {reason}")
+            return user_record
+
+        print(f"[{user_id}] Extracting passport data with Qwen...")
+        passport_data = await loop.run_in_executor(
+            None, qwen_agent.extract_passport, passport_front, passport_back
+        )
+        if not passport_data or "error" in passport_data:
+            error_msg = passport_data.get("error", "Unknown error") if passport_data else "No response"
+            user_record.update({
+                "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+                "rejection_reasons": ["passport_extraction_failed"],
+                "error_log": f"Passport extraction failed: {error_msg}"
+            })
+            print(f"[{user_id}] REJECTED: Passport extraction failed")
+            return user_record
+
+        user_record["passport_found"] = True
+        user_record["passport_number"] = passport_data.get("passport_number", "")
+        user_record["passport_name"] = passport_data.get("name", "")
+        user_record["passport_dob"] = passport_data.get("dob", "")
+        user_record["passport_gender"] = passport_data.get("gender", "")
+        user_record["passport_nationality"] = passport_data.get("nationality", "")
+        user_record["passport_country"] = passport_data.get("country", "")
+        user_record["passport_expiry"] = passport_data.get("date_of_expiry", "")
+        print(f"[{user_id}] Passport extracted - Number: {user_record['passport_number']}, Name: {user_record['passport_name']}")
+
+    except Exception as e:
+        user_record.update({
+            "status": "REJECTED", "final_decision": "REJECTED", "status_code": 1,
+            "rejection_reasons": ["passport_processing_error"],
+            "error_log": f"Passport exception: {str(e)}"
+        })
+        print(f"[{user_id}] REJECTED: Passport exception: {e}")
+        return user_record
+
+    # ========================================================================
+    # Step 2: Face Embedding Verification (selfie vs passport photo)
+    # ========================================================================
+    face_verification_result = None
+    if images.get("selfie") and passport_front and face_verifier_ready:
+        try:
+            print(f"[{user_id}] Running face embedding verification (passport)...")
+            from app.faceEmbeddings import verify_faces_memory
+
+            selfie_input = images["selfie"]
+            if isinstance(selfie_input, io.BytesIO):
+                selfie_input.seek(0)
+            if isinstance(passport_front, io.BytesIO):
+                passport_front.seek(0)
+
+            face_verification_result = await loop.run_in_executor(
+                None,
+                lambda s, a, u, p: verify_faces_memory(s, a, u, p),
+                selfie_input,
+                passport_front,
+                str(user_id),
+                product
+            )
+
+            face_sim = face_verification_result.get("similarity_score", 0.0)
+            face_verified = face_verification_result.get("verified", False)
+            is_duplicate = face_verification_result.get("is_duplicate", False)
+            face_error = face_verification_result.get("error")
+
+            print(f"[{user_id}] Face similarity: {face_sim}, verified: {face_verified}, duplicate: {is_duplicate}")
+
+            if is_duplicate:
+                dup_user = face_verification_result.get("duplicate_user_id", "unknown")
+                user_record["rejection_reasons"].append(f"duplicate_face_matches_{dup_user}")
+                print(f"[{user_id}] DUPLICATE FACE detected (matches {dup_user}) — routing to REVIEW (face is non-rejecting for passport)")
+
+            if face_error and not face_verified:
+                user_record["error_log"] += f"Face verification: {face_error}; "
+
+        except Exception as e:
+            print(f"[{user_id}] Face embedding verification failed: {e}")
+            user_record["error_log"] += f"Face embedding exception: {str(e)}; "
+
+    # ========================================================================
+    # Step 3: Calculate Score (passport rules)
+    # ========================================================================
+    if verification_scorer:
+        try:
+            entity_data = {
+                "passport_number": user_record["passport_number"],
+                "name": user_record["passport_name"],
+                "dob": user_record["passport_dob"],
+                "gender": user_record["passport_gender"],
+            }
+
+            scoring_result = verification_scorer.calculate_passport_score(
+                entity_data=entity_data,
+                expected_dob=expected_dob,
+                expected_name=expected_name,
+                face_verification_result=face_verification_result,
+            )
+
+            final_score = scoring_result["total_score"]
+            final_status = scoring_result["status"]
+            rejection_reasons = scoring_result["rejection_reasons"]
+
+            user_record["score"] = final_score
+            user_record["status"] = final_status
+            user_record["final_decision"] = final_status
+            status_code_map = {"APPROVED": 2, "REVIEW": 0, "REJECTED": 1}
+            user_record["status_code"] = status_code_map.get(final_status, 0)
+            user_record["rejection_reasons"].extend(rejection_reasons)
+
+            print(f"[{user_id}] -> {final_status} (Score: {final_score})")
+            if rejection_reasons:
+                print(f"[{user_id}] Rejection Reasons: {', '.join(rejection_reasons)}")
+
+            # Post-scoring: face is NEVER a hard reject for passport.
+            # If not already rejected on name/dob, route face problems to REVIEW.
+            if final_status != "REJECTED":
+                face_problem = False
+                if face_verification_result is not None:
+                    if face_verification_result.get("is_duplicate", False):
+                        face_problem = True
+                        user_record["rejection_reasons"].append("duplicate_face_review")
+                    elif not face_verification_result.get("verified", False):
+                        face_problem = True
+                        similarity = float(face_verification_result.get("similarity_score", 0.0))
+                        face_error = face_verification_result.get("error")
+                        if face_error and "No face detected" in face_error:
+                            user_record["rejection_reasons"].append("no_face_detected")
+                        else:
+                            user_record["rejection_reasons"].append(f"face_similarity_low_{similarity:.4f}")
+                if face_problem:
+                    user_record["status"] = "REVIEW"
+                    user_record["final_decision"] = "REVIEW"
+                    user_record["status_code"] = 0
+                    print(f"[{user_id}] -> REVIEW (face check non-conclusive; face is non-rejecting for passport)")
+
+        except Exception as e:
+            print(f"[{user_id}] Passport scoring exception: {e}")
+            user_record["error_log"] += f"Scoring exception: {str(e)}; "
+            user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
+            user_record["rejection_reasons"].append("scoring_error")
+    else:
+        print(f"[{user_id}] VerificationScorer not initialized, using fallback")
+        user_record.update({"status": "REVIEW", "final_decision": "REVIEW", "status_code": 0, "score": 0})
+        user_record["rejection_reasons"].append("scorer_not_initialized")
+
+    # ========================================================================
+    # Step 4: Build extracted_data (enriched)
+    # ========================================================================
+    user_record["extracted_data"] = {
+        "passport_number": user_record["passport_number"],
+        "name": user_record["passport_name"],
+        "dob": user_record["passport_dob"],
+        "gender": user_record["passport_gender"],
+        "nationality": user_record["passport_nationality"],
+        "country": user_record["passport_country"],
+        "expiry": user_record["passport_expiry"],
+    }
+    user_record["_internal"] = {
+        "doc_type": "passport",
+        "face_similarity": float(face_verification_result.get("similarity_score", 0.0)) if face_verification_result else 0.0,
+        "face_verified": bool(face_verification_result.get("verified", False)) if face_verification_result else False,
+        "is_duplicate_face": bool(face_verification_result.get("is_duplicate", False)) if face_verification_result else False,
+    }
+
+    return user_record
+
 # --- API Endpoints ---
 @app.post("/batch/verify")
 async def start_batch_verification(req: BatchVerifyRequest, background_tasks: BackgroundTasks):
@@ -965,11 +1301,16 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
 
         selfie_img, front_img, back_img = results[0], results[1], results[2]
 
-        # Check if mandatory files exist (all three required)
+        # Mandatory files differ by pipeline. India (Aadhaar) needs front+back+selfie.
+        # Passport (non-India) needs only the primary passport page (passport_first).
+        is_india = _is_india(req.country)
         missing = []
-        if not selfie_img: missing.append("selfie")
-        if not front_img: missing.append("aadhar_front")
-        if not back_img: missing.append("aadhar_back")
+        if is_india:
+            if not selfie_img: missing.append("selfie")
+            if not front_img: missing.append("aadhar_front")
+            if not back_img: missing.append("aadhar_back")
+        else:
+            if not front_img: missing.append("passport_first")
         if missing:
             return {
                 "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
@@ -985,7 +1326,10 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
         }
 
         # Verify user passing memory objects
-        result = await verify_single_user(user_id, images, req.dob, req.gender)
+        result = await verify_single_user(
+            user_id, images, req.dob, req.gender,
+            country=req.country, expected_name=req.name
+        )
 
         # Encrypted audit log
         if encrypted_logger:
@@ -1008,7 +1352,7 @@ async def _run_verification(req: VerifyRequest, debug: bool = False):
         gc.collect()
 
 # --- Mahafraxn Verification Helpers ---
-async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False, agent_name: str = "default"):
+async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[str], gender: Optional[str], debug: bool = False):
     """Internal helper for Mahafraxn verification pipeline"""
     try:
         has_selfie = images.get("selfie") is not None
@@ -1046,7 +1390,7 @@ async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[
             }
 
             try:
-                mahafraxn_logger.log(agent_name, user_id, result)
+                mahafraxn_logger.log(user_id, result)
             except Exception as log_err:
                 print(f"[mahafraxn][{user_id}] JSON logging failed: {log_err}")
 
@@ -1080,9 +1424,9 @@ async def _run_mahafraxn_verification(images: dict, user_id: str, dob: Optional[
 
         result = await verify_single_user(user_id, images, dob, gender, product="mahafraxn")
 
-        # JSON log to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json
+        # JSON log to logs/mahafraxn-logs/{date}/{user_id}.json
         try:
-            mahafraxn_logger.log(agent_name, user_id, result)
+            mahafraxn_logger.log(user_id, result)
         except Exception as log_err:
             print(f"[mahafraxn][{user_id}] JSON logging failed: {log_err}")
 
@@ -1124,56 +1468,35 @@ def _filter_response(full_record: dict) -> dict:
 
 # --- Mahafraxn Endpoint ---
 @app.post("/mahafraxn/verify")
-async def mahafraxn_verify(
-    user_id: str = Form(...),
-    agent_name: str = Form("default"),
-    documents_aadhaar_front: UploadFile = File(None),
-    documents_aadhaar_back: UploadFile = File(None),
-    documents_selfie: UploadFile = File(None),
-    aadhar_front_url: Optional[str] = Form(None),
-    aadhar_back_url: Optional[str] = Form(None),
-    selfie_url: Optional[str] = Form(None),
-    dob: Optional[str] = Form(None),
-    gender: Optional[str] = Form(None),
-):
+async def mahafraxn_verify(req: MahafraxnVerifyRequest):
     """
-    Unified Mahafraxn verification endpoint.
-    Accepts raw file uploads (multipart/form-data) OR presigned URLs.
-    Priority: raw file upload first, falls back to URL if file not provided or empty.
-    Logs are written to logs/mahafraxn-logs/{agent_name}/{date}/{user_id}.json
+    Mahafraxn verification endpoint — accepts JSON body.
+    Logs are written to logs/mahafraxn-logs/{date}/{user_id}.json
     """
+    user_id = str(req.user_id)
     try:
-        print(f"[mahafraxn][{agent_name}][{user_id}] Resolving images (upload > URL fallback)...")
-
-        async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
-            # Try raw file upload first
-            if upload and upload.size and upload.size > 0:
-                raw = await upload.read()
-                if raw:
-                    print(f"[mahafraxn][{agent_name}][{user_id}] {label}: loaded from upload ({len(raw)} bytes)")
-                    return io.BytesIO(raw)
-            # Fallback to presigned URL / CDN link
-            if url:
-                print(f"[mahafraxn][{agent_name}][{user_id}] {label}: fetching from URL...")
-                img = await fetch_file(http_session, url)
-                if img:
-                    return img
-                print(f"[mahafraxn][{agent_name}][{user_id}] {label}: URL fetch failed")
-            return None
+        print(f"[mahafraxn][{user_id}] Fetching images from URLs...")
 
         front_img, back_img, selfie_img = await asyncio.gather(
-            resolve_image(documents_aadhaar_front, aadhar_front_url, "aadhar_front"),
-            resolve_image(documents_aadhaar_back, aadhar_back_url, "aadhar_back"),
-            resolve_image(documents_selfie, selfie_url, "selfie"),
+            fetch_file(http_session, req.aadhar_front_url),
+            fetch_file(http_session, req.aadhar_back_url),
+            fetch_file(http_session, req.selfie_url),
         )
 
-        images = {
-            "aadhar_front": front_img,
-            "aadhar_back": back_img,
-            "selfie": selfie_img,
-        }
+        missing = []
+        if not front_img: missing.append("aadhar_front")
+        if not back_img: missing.append("aadhar_back")
+        if not selfie_img: missing.append("selfie")
+        if missing:
+            return {
+                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
+                "status_code": 1, "score": 0, "product": "mahafraxn",
+                "reason": f"Image fetch failed: {', '.join(missing)}",
+                "rejection_reasons": [f"file_download_failed_{m}" for m in missing]
+            }
 
-        return await _run_mahafraxn_verification(images, user_id, dob, gender, agent_name=agent_name)
+        images = {"aadhar_front": front_img, "aadhar_back": back_img, "selfie": selfie_img}
+        return await _run_mahafraxn_verification(images, user_id, req.dob, req.gender)
 
     except Exception as e:
         print(f"[mahafraxn] Endpoint error: {e}")
@@ -1181,46 +1504,32 @@ async def mahafraxn_verify(
         return {"status": "error", "message": str(e), "user_id": user_id, "product": "mahafraxn"}
 
 @app.post("/mahafraxn/verify/debug")
-async def mahafraxn_verify_debug(
-    user_id: str = Form(...),
-    agent_name: str = Form("default"),
-    documents_aadhaar_front: UploadFile = File(None),
-    documents_aadhaar_back: UploadFile = File(None),
-    documents_selfie: UploadFile = File(None),
-    aadhar_front_url: Optional[str] = Form(None),
-    aadhar_back_url: Optional[str] = Form(None),
-    selfie_url: Optional[str] = Form(None),
-    dob: Optional[str] = Form(None),
-    gender: Optional[str] = Form(None),
-):
-    """Mahafraxn verification - Returns FULL VERBOSE JSON (Debug). Same input as /mahafraxn/verify."""
+async def mahafraxn_verify_debug(req: MahafraxnVerifyRequest):
+    """Mahafraxn verification — JSON body, returns full verbose record."""
+    user_id = str(req.user_id)
     try:
-        print(f"[mahafraxn][{agent_name}][{user_id}] Resolving images (debug, upload > URL fallback)...")
-
-        async def resolve_image(upload: Optional[UploadFile], url: Optional[str], label: str) -> Optional[io.BytesIO]:
-            if upload and upload.size and upload.size > 0:
-                raw = await upload.read()
-                if raw:
-                    return io.BytesIO(raw)
-            if url:
-                img = await fetch_file(http_session, url)
-                if img:
-                    return img
-            return None
+        print(f"[mahafraxn][{user_id}] Fetching images from URLs (debug)...")
 
         front_img, back_img, selfie_img = await asyncio.gather(
-            resolve_image(documents_aadhaar_front, aadhar_front_url, "aadhar_front"),
-            resolve_image(documents_aadhaar_back, aadhar_back_url, "aadhar_back"),
-            resolve_image(documents_selfie, selfie_url, "selfie"),
+            fetch_file(http_session, req.aadhar_front_url),
+            fetch_file(http_session, req.aadhar_back_url),
+            fetch_file(http_session, req.selfie_url),
         )
 
-        images = {
-            "aadhar_front": front_img,
-            "aadhar_back": back_img,
-            "selfie": selfie_img,
-        }
+        missing = []
+        if not front_img: missing.append("aadhar_front")
+        if not back_img: missing.append("aadhar_back")
+        if not selfie_img: missing.append("selfie")
+        if missing:
+            return {
+                "user_id": user_id, "status": "FAILED", "final_decision": "REJECTED",
+                "status_code": 1, "score": 0, "product": "mahafraxn",
+                "reason": f"Image fetch failed: {', '.join(missing)}",
+                "rejection_reasons": [f"file_download_failed_{m}" for m in missing]
+            }
 
-        return await _run_mahafraxn_verification(images, user_id, dob, gender, debug=True, agent_name=agent_name)
+        images = {"aadhar_front": front_img, "aadhar_back": back_img, "selfie": selfie_img}
+        return await _run_mahafraxn_verification(images, user_id, req.dob, req.gender, debug=True)
 
     except Exception as e:
         print(f"[mahafraxn] Debug endpoint error: {e}")
@@ -1281,31 +1590,25 @@ async def audit_list_users():
 
 # --- Mahafraxn Audit Endpoints ---
 @app.get("/audit/mahafraxn")
-async def mahafraxn_audit_agents():
-    """List all agent names that have Mahafraxn logs."""
-    agents = mahafraxn_logger.list_agents()
-    return {"status": "ok", "count": len(agents), "agents": agents}
+async def mahafraxn_audit_dates():
+    """List all dates that have Mahafraxn logs."""
+    dates = mahafraxn_logger.list_dates()
+    return {"status": "ok", "count": len(dates), "dates": dates}
 
-@app.get("/audit/mahafraxn/{agent_name}")
-async def mahafraxn_audit_dates(agent_name: str):
-    """List all dates that have Mahafraxn logs for a given agent."""
-    dates = mahafraxn_logger.list_dates(agent_name)
-    return {"status": "ok", "agent_name": agent_name, "count": len(dates), "dates": dates}
+@app.get("/audit/mahafraxn/{date}")
+async def mahafraxn_audit_users(date: str):
+    """List all user IDs logged on a specific date."""
+    users = mahafraxn_logger.list_users(date)
+    return {"status": "ok", "date": date, "count": len(users), "user_ids": users}
 
-@app.get("/audit/mahafraxn/{agent_name}/{date}")
-async def mahafraxn_audit_users(agent_name: str, date: str):
-    """List all user IDs logged under a specific agent and date."""
-    users = mahafraxn_logger.list_users(agent_name, date)
-    return {"status": "ok", "agent_name": agent_name, "date": date, "count": len(users), "user_ids": users}
-
-@app.get("/audit/mahafraxn/{agent_name}/{date}/{user_id}")
-async def mahafraxn_audit_user(agent_name: str, date: str, user_id: str):
+@app.get("/audit/mahafraxn/{date}/{user_id}")
+async def mahafraxn_audit_user(date: str, user_id: str):
     """Return the JSON verification log for a specific Mahafraxn user."""
     try:
-        record = mahafraxn_logger.read(agent_name, date, user_id)
-        return {"status": "ok", "agent_name": agent_name, "date": date, "user_id": user_id, "record": record}
+        record = mahafraxn_logger.read(date, user_id)
+        return {"status": "ok", "date": date, "user_id": user_id, "record": record}
     except FileNotFoundError:
-        return {"status": "not_found", "message": f"No log for {agent_name}/{date}/{user_id}"}
+        return {"status": "not_found", "message": f"No log for {date}/{user_id}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

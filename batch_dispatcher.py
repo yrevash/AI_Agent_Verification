@@ -610,7 +610,11 @@ async def process_single_user(session, user, session_dir, agent_id):
             "passport_first": user.get("passport_first"),
             "passport_old": user.get("passport_old"),
             "selfie_photo": user.get("selfie_photo"),
-            "gender": user.get("gender")
+            "gender": user.get("gender"),
+            # Country drives pipeline routing on the AI server (India -> Aadhaar, else -> passport)
+            "country": user.get("country") or user.get("country_name") or user.get("nationality"),
+            # Expected name used for passport name-matching (same source as dob)
+            "name": user.get("name") or user.get("full_name")
         }
         
         # Handle image paths
